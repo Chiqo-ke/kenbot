@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Django
+*.pyc
+db.sqlite3
+/backend/db.sqlite3
+/backend/staticfiles/
+/backend/media/
+*.log
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Secrets — token files written by auth_github.py
+.github_token
+/backend/.github_token
+
+# Map data files (generated at runtime)
+/backend/map_files/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

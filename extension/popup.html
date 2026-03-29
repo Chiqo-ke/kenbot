@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KenBot</title>
+  <style>
+    /* ── Reset ─────────────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 320px;
+      min-height: 200px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      color: #1a1a1a;
+      background: #ffffff;
+    }
+
+    /* ── Header ─────────────────────────────────────────────────────────────── */
+    .popup-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 14px 16px 12px;
+      background: #1a5276;
+      color: #ffffff;
+    }
+
+    .popup-logo {
+      width: 32px;
+      height: 32px;
+      background: #fcf3cf;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      font-size: 13px;
+      color: #1a5276;
+      flex-shrink: 0;
+      letter-spacing: -0.5px;
+    }
+
+    .popup-title {
+      font-size: 16px;
+      font-weight: 700;
+      flex: 1;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.connected    { background: #2ecc71; }
+    .status-dot.disconnected { background: #95a5a6; }
+    .status-dot.error        { background: #e74c3c; }
+
+    /* ── Body ────────────────────────────────────────────────────────────────── */
+    .popup-body { padding: 16px; }
+
+    /* ── Status Banner ───────────────────────────────────────────────────────── */
+    .status-banner {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 6px;
+      background: #f0f3f4;
+      margin-bottom: 14px;
+      font-size: 13px;
+      color: #555;
+    }
+    .status-banner .status-label { font-weight: 600; }
+
+    /* ── Session Info ────────────────────────────────────────────────────────── */
+    .session-info {
+      font-size: 12px;
+      color: #888;
+      margin-bottom: 14px;
+      word-break: break-all;
+    }
+
+    /* ── Quick-task input ────────────────────────────────────────────────────── */
+    .task-form {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    .task-form label {
+      font-size: 12px;
+      font-weight: 600;
+      color: #444;
+    }
+
+    .task-input-row { display: flex; gap: 6px; }
+
+    .task-input {
+      flex: 1;
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .task-input:focus { border-color: #1a5276; }
+
+    .send-btn {
+      padding: 8px 12px;
+      background: #1a5276;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 14px;
+      transition: background 0.15s;
+    }
+    .send-btn:hover  { background: #154360; }
+    .send-btn:active { background: #0f2f45; }
+
+    /* ── Auth Section ────────────────────────────────────────────────────────── */
+    .auth-section { border-top: 1px solid #eee; padding-top: 14px; }
+
+    .auth-section h2 {
+      font-size: 12px;
+      font-weight: 600;
+      color: #444;
+      margin-bottom: 10px;
+    }
+
+    .auth-form { display: flex; flex-direction: column; gap: 8px; }
+
+    .auth-input {
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      outline: none;
+      width: 100%;
+    }
+    .auth-input:focus { border-color: #1a5276; }
+
+    .btn-row { display: flex; gap: 8px; }
+
+    .btn {
+      flex: 1;
+      padding: 8px 0;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .btn:hover  { opacity: 0.85; }
+    .btn:active { opacity: 0.7; }
+    .btn--primary  { background: #1a5276; color: #fff; }
+    .btn--danger   { background: #e74c3c; color: #fff; }
+
+    /* ── Toast notifications ────────────────────────────────────────────────── */
+    #toast {
+      position: fixed;
+      bottom: 12px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #2c3e50;
+      color: #fff;
+      font-size: 12px;
+      padding: 6px 14px;
+      border-radius: 20px;
+      opacity: 0;
+      transition: opacity 0.2s;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    #toast.visible { opacity: 1; }
+  </style>
+</head>
+<body>
+  <header class="popup-header">
+    <div class="popup-logo" aria-hidden="true">KB</div>
+    <span class="popup-title">KenBot</span>
+    <span id="popup-status-dot" class="status-dot disconnected" title="Disconnected"></span>
+  </header>
+
+  <div class="popup-body">
+    <!-- Connection status banner -->
+    <div class="status-banner" id="status-banner" role="status" aria-live="polite">
+      <span id="status-text" class="status-label">Not connected</span>
+    </div>
+
+    <!-- Session ID (shown when active) -->
+    <p class="session-info" id="session-info" hidden></p>
+
+    <!-- Quick-task form -->
+    <form class="task-form" id="task-form" autocomplete="off">
+      <label for="task-input">Start a task:</label>
+      <div class="task-input-row">
+        <input
+          id="task-input"
+          class="task-input"
+          type="text"
+          placeholder="e.g. Renew driving licence…"
+          aria-label="Task description"
+          autocomplete="off"
+        />
+        <button type="submit" class="send-btn" aria-label="Send task">&#9658;</button>
+      </div>
+    </form>
+
+    <!-- Auth section -->
+    <section class="auth-section" id="auth-section">
+      <h2>Account</h2>
+      <div id="logged-out-view">
+        <form class="auth-form" id="login-form" autocomplete="off">
+          <input id="username-input" class="auth-input" type="text"     placeholder="Username" aria-label="Username" autocomplete="username" />
+          <input id="password-input" class="auth-input" type="password" placeholder="Password" aria-label="Password" autocomplete="current-password" />
+          <div class="btn-row">
+            <button type="submit" class="btn btn--primary" id="login-btn">Log in</button>
+          </div>
+        </form>
+      </div>
+      <div id="logged-in-view" hidden>
+        <div class="btn-row">
+          <button class="btn btn--danger" id="logout-btn">Log out</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" role="alert" aria-live="assertive" aria-atomic="true"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
