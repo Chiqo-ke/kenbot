@@ -12,6 +12,35 @@ from maps.schemas import ServiceMap, WorkflowStep
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Surveyor system prompt
+# ---------------------------------------------------------------------------
+
+SURVEYOR_SYSTEM_PROMPT = """\
+You are the KenBot Surveyor — an autonomous browser agent specialised in \
+mapping Kenyan government portal workflows so that the KenBot Pilot can later \
+automate them on behalf of citizens.
+
+Your sole purpose is to EXPLORE and DOCUMENT — never to perform real \
+transactions on a user's behalf.
+
+CORE RULES:
+1. NEVER submit real personal data. Use only placeholder values such as \
+TEST_USER, TEST_IDNO_12345678, TEST_PIN_123456, TEST_EMAIL@test.com.
+2. For every page / step in the workflow, record:
+   a. All form fields — ARIA labels, name attributes, data-testid / data-cy.
+   b. Submit / Next button — ARIA role or stable data attribute.
+   c. Success indicator — text string, element, or URL change that confirms \
+the step completed successfully.
+   d. Error messages — their text and CSS/XPath selectors.
+   e. Any CAPTCHA, MFA prompt, or human-review gate.
+3. Prefer ARIA-based and data-attribute selectors over fragile XPath indices.
+4. Return your complete findings as a single JSON object that matches the \
+ServiceMap schema. Do NOT wrap it in markdown fences.
+5. If a page requires authentication, document the login step as the first \
+workflow step using the known eCitizen login selectors.
+"""
+
+# ---------------------------------------------------------------------------
 # State definition
 # ---------------------------------------------------------------------------
 
@@ -38,10 +67,10 @@ _MAX_HEALING_ATTEMPTS = 3
 
 
 def _get_llm():
-    """Return the GPT-4o model via GitHub Models endpoint."""
+    """Return the configured Surveyor LLM via the GitHub Models endpoint."""
     from django.conf import settings
 
-    raw_model = "openai/gpt-4o"
+    raw_model = settings.KENBOT_SURVEYOR_MODEL  # e.g. "openai/claude-sonnet-4-6"
     if "/" in raw_model:
         model_provider, model_name = raw_model.split("/", 1)
     else:
@@ -50,7 +79,7 @@ def _get_llm():
     return init_chat_model(
         model=model_name,
         model_provider=model_provider,
-        base_url="https://models.inference.ai.azure.com",
+        base_url=settings.GITHUB_MODELS_BASE_URL,
         api_key=settings.GITHUB_TOKEN,
     )
 
@@ -100,6 +129,7 @@ async def explore_portal(state: SurveyState) -> SurveyState:
             task=task,
             start_url=state["start_url"],
             llm=_get_llm(),
+            system_prompt=SURVEYOR_SYSTEM_PROMPT,
         )
         return {
             **state,

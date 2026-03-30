@@ -23,11 +23,14 @@ class ExecutionState(BaseModel):
     status: Literal[
         "idle",
         "loading_map",
+        "navigating",
         "executing",
         "awaiting_user_confirmation",
         "awaiting_captcha",
         "awaiting_healing",
         "awaiting_vault_key",
+        "awaiting_human_input",
+        "awaiting_user_input_on_portal",
         "completed",
         "failed",
     ] = "idle"

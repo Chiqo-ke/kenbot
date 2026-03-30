@@ -35,6 +35,7 @@ class PilotSession(models.Model):
     step_index = models.PositiveIntegerField(default=0)
     total_steps = models.PositiveIntegerField(default=0)
     error_message = models.TextField(blank=True, default="")
+    chat_history = models.JSONField(default=list, blank=True)
     started_at = models.DateTimeField(auto_now_add=True)
     ended_at = models.DateTimeField(null=True, blank=True)
 

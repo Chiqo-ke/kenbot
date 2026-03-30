@@ -22,6 +22,7 @@ async def run_browser_exploration(
     task: str,
     start_url: str,
     llm: Any,
+    system_prompt: str | None = None,
 ) -> dict:
     """
     Spin up a browser-use Agent, run the exploration task, and return the
@@ -29,6 +30,11 @@ async def run_browser_exploration(
 
     The agent is instructed to return a ServiceMap-shaped JSON object.
     The caller (agent.py) is responsible for Pydantic validation.
+
+    Args:
+        system_prompt: Optional text appended to browser-use's default system
+            prompt via ``extend_system_message``, making the agent aware of
+            its role as the KenBot Surveyor.
     """
     from browser_use import Agent, Browser, BrowserConfig
 
@@ -46,6 +52,8 @@ async def run_browser_exploration(
             browser=browser,
             # Tell browser-use to prefer the accessibility tree approach.
             use_vision=False,
+            # Extend the default system prompt with the Surveyor's purpose.
+            extend_system_message=system_prompt,
         )
         result = await agent.run()
         raw_text: str = result.final_result() or "{}"

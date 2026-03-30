@@ -32,8 +32,16 @@ class MapRepository:
     def get_map(self, service_id: str) -> ServiceMap | None:
         """Return a validated ServiceMap for *service_id*, or None if not found."""
         try:
-            record = ServiceMapRecord.objects.get(service_id=service_id, is_active=True)
-        except ServiceMapRecord.DoesNotExist:
+            record = (
+                ServiceMapRecord.objects
+                .filter(service_id=service_id, is_active=True)
+                .order_by("-id")
+                .first()
+            )
+        except Exception as exc:
+            logger.error("DB error looking up service_id=%s: %s", service_id, exc)
+            return None
+        if record is None:
             logger.warning("No active ServiceMapRecord for service_id=%s", service_id)
             return None
 

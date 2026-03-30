@@ -178,7 +178,7 @@ KENBOT_PILOT_MODEL: str = os.environ.get(
     "KENBOT_PILOT_MODEL", "openai/gpt-4o-mini"
 )
 KENBOT_SURVEYOR_MODEL: str = os.environ.get(
-    "KENBOT_SURVEYOR_MODEL", "openai/gpt-4o"
+    "KENBOT_SURVEYOR_MODEL", "openai/claude-sonnet-4-6"
 )
 
 # ---------------------------------------------------------------------------
@@ -286,5 +286,23 @@ LOGGING = {
         "surveyor": {"handlers": ["console"], "level": "DEBUG", "propagate": False},
         "vault": {"handlers": ["console"], "level": "WARNING", "propagate": False},
         "maps": {"handlers": ["console"], "level": "DEBUG", "propagate": False},
+        "kenbot": {"handlers": ["console"], "level": "DEBUG", "propagate": False},
     },
+}
+
+# ---------------------------------------------------------------------------
+# SimpleJWT — token lifetimes
+# ---------------------------------------------------------------------------
+from datetime import timedelta  # noqa: E402
+
+SIMPLE_JWT = {
+    "ACCESS_TOKEN_LIFETIME": timedelta(hours=1),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
+    "ROTATE_REFRESH_TOKENS": False,
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": SECRET_KEY,
+    "AUTH_HEADER_TYPES": ("Bearer",),
+    "USER_ID_FIELD": "id",
+    "USER_ID_CLAIM": "user_id",
+    "TOKEN_TYPE_CLAIM": "token_type",
 }

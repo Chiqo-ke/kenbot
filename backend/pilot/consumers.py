@@ -6,7 +6,7 @@ import uuid
 
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from pilot.agent import build_pilot_agent
 from pilot.state import ExecutionState
@@ -35,6 +35,7 @@ class PilotConsumer(AsyncWebsocketConsumer):
         {"type": "captcha_solved"}
         {"type": "captcha_detected"}
         {"type": "vault_key_added",    "vault_key": "..."}
+        {"type": "user_form_filled"}   ← user finished filling portal form
 
     Server → extension
         {"type": "agent_message",      "content_en": "...",  "content_sw": "..."}
@@ -42,6 +43,7 @@ class PilotConsumer(AsyncWebsocketConsumer):
         {"type": "pause_confirmation", "step_label": "...",  "fields": "..."}
         {"type": "await_captcha"}
         {"type": "await_vault_key",    "missing_keys": [...]}
+        {"type": "open_url",           "url": "...",         "missing_keys": "..."}
         {"type": "state_update",       "state": {...}}
         {"type": "error",              "message": "..."}
         {"type": "session_complete"}
@@ -54,6 +56,12 @@ class PilotConsumer(AsyncWebsocketConsumer):
     async def connect(self) -> None:
         self.session_id: str = self.scope["url_route"]["kwargs"]["session_id"]
         self.user = self.scope.get("user", None)
+
+        # Extract the browser extension's anon_key from the query string.
+        # The extension passes it as ?vault_key=<UUID> alongside the JWT token.
+        from urllib.parse import parse_qs
+        qs = parse_qs(self.scope.get("query_string", b"").decode())
+        self.anon_key: str | None = (qs.get("vault_key") or [None])[0]
 
         # Reject anonymous (unauthenticated) WebSocket connections.
         # We must accept() first so the browser receives a proper WS close
@@ -71,8 +79,9 @@ class PilotConsumer(AsyncWebsocketConsumer):
         self.state = ExecutionState()
         self.agent_executor = build_pilot_agent()
 
-        # Create a DB session record (sync DB access runs in a thread pool)
-        await self._create_session_record()
+        # Create or restore a DB session record.
+        # Returns stored chat_history and execution state if this is a reconnect.
+        await self._connect_session_record()
 
         logger.info(
             "PilotConsumer connected session=%s",
@@ -86,8 +95,12 @@ class PilotConsumer(AsyncWebsocketConsumer):
             getattr(self, "session_id", "?"),
             close_code,
         )
-        if hasattr(self, "state") and self.state.status not in ("completed", "failed"):
-            await self._update_session_status("disconnected")
+        if hasattr(self, "state"):
+            if self.state.status not in ("completed", "failed"):
+                await self._update_session_status("disconnected")
+            # Always persist chat + execution progress so the agent has full
+            # context when this session reconnects after a cross-origin navigation.
+            await self._save_session_state()
 
     # ------------------------------------------------------------------
     # Message dispatcher
@@ -109,7 +122,9 @@ class PilotConsumer(AsyncWebsocketConsumer):
             "captcha_solved": self._handle_captcha_solved,
             "captcha_detected": self._handle_captcha_detected,
             "vault_key_added": self._handle_vault_key_added,
+            "user_form_filled": self._handle_user_form_filled,
             "confirmation_response": self._handle_confirmation_response,
+            "resume_workflow": self._handle_resume_workflow,
         }
 
         handler = handlers.get(msg_type)
@@ -154,10 +169,18 @@ class PilotConsumer(AsyncWebsocketConsumer):
         if self.state.step_index >= self.state.total_steps:
             self.state.status = "completed"
             await self._send({"type": "session_complete"})
-        else:
-            self.state.status = "executing"
+            await self._send({"type": "state_update", "state": self.state.model_dump()})
+            return
 
+        self.state.status = "executing"
         await self._send({"type": "state_update", "state": self.state.model_dump()})
+
+        # Continue the workflow loop — ask the agent to dispatch the next step
+        response_text = await self._run_agent(
+            f"Step '{step_id}' completed successfully. Continue to the next step in the workflow."
+        )
+        if response_text:
+            await self._dispatch_agent_output(response_text)
 
     async def _handle_step_failed(self, data: dict) -> None:
         """
@@ -220,6 +243,16 @@ class PilotConsumer(AsyncWebsocketConsumer):
         if response_text:
             await self._dispatch_agent_output(response_text)
 
+    async def _handle_user_form_filled(self, data: dict) -> None:
+        logger.info("User filled portal form session=%s", self.session_id)
+        self.state.status = "executing"
+        await self._send({"type": "state_update", "state": self.state.model_dump()})
+        response_text = await self._run_agent(
+            "The user has filled in their details on the portal. Continue guiding them through the remaining steps."
+        )
+        if response_text:
+            await self._dispatch_agent_output(response_text)
+
     async def _handle_confirmation_response(self, data: dict) -> None:
         """
         Extension user confirmed or cancelled a submit/pay step.
@@ -254,12 +287,57 @@ class PilotConsumer(AsyncWebsocketConsumer):
         if response_text:
             await self._dispatch_agent_output(response_text)
 
+    async def _handle_resume_workflow(self, data: dict) -> None:
+        """
+        Extension sends this after a cross-origin page navigation so the
+        server-side state is restored and the workflow continues from the
+        correct step index.
+        """
+        self.state.service_id = data.get("service_id", self.state.service_id)
+        self.state.step_index = data.get("step_index", self.state.step_index)
+        self.state.total_steps = data.get("total_steps", self.state.total_steps)
+        self.state.current_step_id = data.get("step_id", self.state.current_step_id)
+        self.state.status = "executing"
+        logger.info(
+            "Workflow resumed service=%s step_index=%s session=%s",
+            self.state.service_id,
+            self.state.step_index,
+            self.session_id,
+        )
+        await self._send({"type": "state_update", "state": self.state.model_dump()})
+        response_text = await self._run_agent(
+            f"Navigation completed. We are now on a new page. "
+            f"The workflow is '{self.state.service_id}', currently at step index "
+            f"{self.state.step_index} of {self.state.total_steps}. "
+            f"Continue with the next execute_workflow_step call."
+        )
+        if response_text:
+            await self._dispatch_agent_output(response_text)
+
     # ------------------------------------------------------------------
     # Agent execution
     # ------------------------------------------------------------------
 
+    # Sentinel prefixes that tools return to trigger consumer-side dispatch.
+    # These must be intercepted from ToolMessages before the LLM prose response
+    # is forwarded to the extension — the LLM may wrap them in natural language.
+    _SENTINEL_PREFIXES = (
+        "EXECUTE_STEP:",
+        "PAUSE_FOR_CONFIRMATION:",
+    )
+
     async def _run_agent(self, user_input: str) -> str | None:
-        """Invoke the LangGraph agent asynchronously and return the output string."""
+        """Invoke the LangGraph agent asynchronously and return the output string.
+
+        If any tool returned a sentinel string (EXECUTE_STEP, AWAIT_VAULT_KEY,
+        OPEN_URL, PAUSE_FOR_CONFIRMATION) during this agent turn, that sentinel
+        is returned directly instead of the final AI prose message. This ensures
+        the consumer always dispatches the sentinel even when the LLM wraps it
+        in natural-language text.
+        """
+        from pilot._session_context import set_current_anon_key
+        if self.anon_key:
+            set_current_anon_key(self.anon_key)
         try:
             # Build messages list from chat history
             messages: list = []
@@ -271,7 +349,22 @@ class PilotConsumer(AsyncWebsocketConsumer):
             messages.append(HumanMessage(content=user_input))
 
             result = await self.agent_executor.ainvoke({"messages": messages})
-            # Last message in the list is the AI response
+
+            # Scan ToolMessages for sentinels — first match wins.
+            # The LLM may wrap the sentinel in prose in its final AIMessage;
+            # intercepting from the ToolMessage is more reliable.
+            for msg in result["messages"]:
+                if isinstance(msg, ToolMessage):
+                    content = msg.content if isinstance(msg.content, str) else ""
+                    if any(content.startswith(p) for p in self._SENTINEL_PREFIXES):
+                        logger.debug(
+                            "Sentinel intercepted from ToolMessage session=%s: %.80s",
+                            self.session_id,
+                            content,
+                        )
+                        return content
+
+            # No sentinel — return the final AI prose message
             last_msg = result["messages"][-1]
             return last_msg.content if hasattr(last_msg, "content") else str(last_msg)
         except Exception as exc:
@@ -300,13 +393,17 @@ class PilotConsumer(AsyncWebsocketConsumer):
             await self._send({"type": "state_update", "state": self.state.model_dump()})
             return
 
-        if output.startswith("AWAIT_VAULT_KEY:"):
-            missing_str = output.split(":", 1)[1]
-            missing_keys = [k.strip() for k in missing_str.split(",") if k.strip()]
-            self.state.status = "awaiting_vault_key"
-            await self._send(
-                {"type": "await_vault_key", "missing_keys": missing_keys}
-            )
+        if output.startswith("EXECUTE_STEP:"):
+            payload = json.loads(output[len("EXECUTE_STEP:"):])
+            self.state.current_step_id = payload.get("step_id")
+            self.state.total_steps = payload.get("total_steps", self.state.total_steps)
+            self.state.service_id = payload.get("service_id", self.state.service_id)
+            self.state.status = "executing"
+            # Forward the step to the extension — keep service_id so the
+            # extension can include it in pendingResume for cross-origin nav.
+            ext_msg = dict(payload)
+            ext_msg["type"] = "execute_step"
+            await self._send(ext_msg)
             await self._send({"type": "state_update", "state": self.state.model_dump()})
             return
 
@@ -364,12 +461,42 @@ class PilotConsumer(AsyncWebsocketConsumer):
         await self._send({"type": "error", "message": message})
 
     @database_sync_to_async
-    def _create_session_record(self) -> None:
+    def _connect_session_record(self) -> None:
+        """Create a new session or restore stored state when reconnecting."""
         from pilot.models import PilotSession
 
-        PilotSession.objects.get_or_create(
+        session, created = PilotSession.objects.get_or_create(
             session_id=self.session_id,
             defaults={"status": "active"},
+        )
+        if not created and session.chat_history:
+            # Reconnect — restore agent context so the LLM remembers the task
+            self.state.chat_history = list(session.chat_history)
+            if session.service_id:
+                self.state.service_id = session.service_id
+            if session.step_index:
+                self.state.step_index = session.step_index
+            if session.total_steps:
+                self.state.total_steps = session.total_steps
+            logger.info(
+                "Session state restored: service=%s step=%d/%d history_len=%d session=%s",
+                self.state.service_id,
+                self.state.step_index,
+                self.state.total_steps,
+                len(self.state.chat_history),
+                self.session_id,
+            )
+
+    @database_sync_to_async
+    def _save_session_state(self) -> None:
+        """Persist chat history and execution progress to the DB."""
+        from pilot.models import PilotSession
+
+        PilotSession.objects.filter(session_id=self.session_id).update(
+            chat_history=list(self.state.chat_history),
+            service_id=self.state.service_id or "",
+            step_index=self.state.step_index,
+            total_steps=self.state.total_steps,
         )
 
     @database_sync_to_async

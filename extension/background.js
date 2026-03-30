@@ -16,11 +16,55 @@
 
 function dbg(...args) { console.debug('[KenBot:bg]', ...args); }
 
+const KENBOT_BACKEND_HTTP = 'http://127.0.0.1:8000';
+
 const PORTAL_PATTERNS = [
   'ecitizen.go.ke',
   'ntsa.go.ke',
   'kra.go.ke'
 ];
+
+// ─── JWT Helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Decode the JWT payload and return the `exp` claim (Unix seconds), or 0.
+ * This does NOT verify the signature — it's only used for expiry pre-checks.
+ */
+function getTokenExp(token) {
+  try {
+    const b64 = token.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    const payload = JSON.parse(atob(b64));
+    return payload.exp || 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** True if the token is expired or within 30 s of expiry. */
+function isTokenExpired(token) {
+  return Date.now() / 1000 >= getTokenExp(token) - 30;
+}
+
+/**
+ * POST /api/auth/token/refresh/ and return the new access token string,
+ * or null if the refresh failed.
+ * @param {string} refreshToken
+ * @returns {Promise<string|null>}
+ */
+async function refreshAccessToken(refreshToken) {
+  try {
+    const res = await fetch(`${KENBOT_BACKEND_HTTP}/api/auth/token/refresh/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh: refreshToken }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.access || null;
+  } catch {
+    return null;
+  }
+}
 
 // ─── Anon-Key Management ──────────────────────────────────────────────────────
 
@@ -106,11 +150,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
 
-    // Popup → background: retrieve stored JWT
+    // Popup/content → background: retrieve stored JWT, auto-refreshing if expired
     case 'GET_AUTH_TOKEN': {
-      chrome.storage.local.get(['kenbot_access_token'], (result) => {
-        sendResponse({ token: result.kenbot_access_token || null });
-      });
+      (async () => {
+        const result = await chrome.storage.local.get(['kenbot_access_token', 'kenbot_refresh_token']);
+        const accessToken = result.kenbot_access_token || null;
+        const refreshToken = result.kenbot_refresh_token || null;
+
+        if (!accessToken) { sendResponse({ token: null }); return; }
+        if (!isTokenExpired(accessToken)) { sendResponse({ token: accessToken }); return; }
+
+        // Access token expired — try a silent refresh
+        if (refreshToken && !isTokenExpired(refreshToken)) {
+          dbg('Access token expired — attempting silent refresh');
+          const newAccess = await refreshAccessToken(refreshToken);
+          if (newAccess) {
+            await chrome.storage.local.set({ kenbot_access_token: newAccess });
+            dbg('Access token refreshed silently');
+            sendResponse({ token: newAccess });
+            return;
+          }
+        }
+
+        // Refresh also failed or refresh token gone — caller must re-login
+        sendResponse({ token: null });
+      })();
       return true;
     }
 

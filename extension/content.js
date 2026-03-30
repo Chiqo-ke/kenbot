@@ -34,6 +34,25 @@ let sessionId = null;
 let reconnectAttempt = 0;
 let shadow = null; // Shadow DOM root, set by mountOverlay()
 
+// Workflow tracking vars — persisted across cross-origin navigations
+let currentServiceId = null;
+let currentStepId = null;
+let currentStepIndex = 0;
+let currentTotalSteps = 0;
+
+// ─── Context validity guard ──────────────────────────────────────────────────
+// When the extension is reloaded during development, chrome.runtime.id becomes
+// undefined and any Chrome API call throws "Extension context invalidated".
+// Check this before every Chrome API call path so we fail silently instead of
+// spamming the console.
+function isContextValid() {
+  try {
+    return !!chrome.runtime?.id;
+  } catch {
+    return false;
+  }
+}
+
 // ─── 1. Overlay Bootstrap ─────────────────────────────────────────────────────
 
 /**
@@ -105,6 +124,9 @@ function mountOverlay() {
     input.value = '';
     sendUserMessage(text);
   });
+
+  // Restore persisted chat history (async, non-blocking).
+  restoreChatHistory();
 }
 
 // ─── 2. WebSocket Connection ──────────────────────────────────────────────────
@@ -115,8 +137,16 @@ function mountOverlay() {
  * Uses exponential back-off on disconnect.
  */
 async function connectToPilot() {
+  if (!isContextValid()) {
+    dbg('Extension context invalidated — stopping reconnect loop.');
+    return;
+  }
+
   if (!sessionId) {
-    sessionId = crypto.randomUUID();
+    // Restore sessionId from chrome.storage.local (survives cross-origin navigation)
+    const stored = await chrome.storage.local.get('kenbotSession');
+    sessionId = stored.kenbotSession?.sessionId || crypto.randomUUID();
+    await chrome.storage.local.set({ kenbotSession: { ...stored.kenbotSession, sessionId } });
   }
 
   // Fetch JWT token from background storage
@@ -132,7 +162,8 @@ async function connectToPilot() {
     return;
   }
 
-  const url = `${KENBOT_WS_BASE}${sessionId}/?token=${encodeURIComponent(tokenResult)}`;
+  const anonKey = await getAnonKey();
+  const url = `${KENBOT_WS_BASE}${sessionId}/?token=${encodeURIComponent(tokenResult)}&vault_key=${encodeURIComponent(anonKey)}`;
   dbg('Connecting WebSocket to', url);
   ws = new WebSocket(url);
 
@@ -142,11 +173,24 @@ async function connectToPilot() {
   ws.addEventListener('error', onWsError);
 }
 
-function onWsOpen() {
+async function onWsOpen() {
   reconnectAttempt = 0;
   dbg('WebSocket opened session=%s', sessionId);
   setStatusIndicator('connected');
-  chrome.runtime.sendMessage({ type: 'SESSION_STARTED', sessionId });
+  if (isContextValid()) chrome.runtime.sendMessage({ type: 'SESSION_STARTED', sessionId });
+
+  // Resume workflow if we navigated cross-origin mid-workflow
+  const stored = await chrome.storage.local.get('kenbotSession');
+  const pending = stored.kenbotSession?.pendingResume;
+  if (pending) {
+    // Clear the pendingResume (keep sessionId)
+    await chrome.storage.local.set({ kenbotSession: { sessionId } });
+    dbg('Resuming workflow after navigation', pending);
+    safeSend({ type: 'resume_workflow', ...pending });
+    appendSystemMessage('↩️ Continuing workflow…', '↩️ Inaendelea…');
+    return;
+  }
+
   appendSystemMessage('Connected to KenBot. How can I help you?', 'Imeunganishwa na KenBot. Naweza kukusaidia?');
 }
 
@@ -156,24 +200,49 @@ function onWsClose(event) {
 
   // Normal closure — clean exit, no reconnect
   if (event.code === 1000) {
-    chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
+    if (isContextValid()) {
+      chrome.storage.local.remove('kenbotSession');
+      chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
+    }
     return;
   }
 
   // Auth failure — server explicitly rejected our token (4001).
-  // Clear the stale/expired token, reset the session ID so a fresh
-  // session is created on next login, and prompt the user to re-login.
-  // Do NOT schedule a reconnect — retrying with the same bad token is futile.
+  // First ask the background to silently refresh the access token.
+  // If the refresh succeeds the reconnect loop will pick up the new token
+  // transparently.  Only clear stored credentials and prompt re-login when
+  // the refresh token is also gone or expired.
   if (event.code === 4001) {
-    dbg('Auth rejected (4001) — clearing stored token, prompting re-login.');
-    chrome.runtime.sendMessage({ type: 'CLEAR_AUTH_TOKEN' });
-    sessionId = null;
-    setStatusIndicator('disconnected');
-    appendSystemMessage(
-      'Your session has expired. Please log in again via the KenBot popup.',
-      'Kipindi chako kimeisha. Tafadhali ingia tena kupitia popup ya KenBot.'
-    );
-    chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
+    (async () => {
+      if (!isContextValid()) {
+        dbg('Extension context invalidated on 4001 — stopping.');
+        return;
+      }
+
+      const tokenResult = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: 'GET_AUTH_TOKEN' }, (response) => {
+          resolve(response && response.token ? response.token : null);
+        });
+      });
+
+      if (tokenResult) {
+        // background.js refreshed the access token — reconnect silently
+        dbg('Token auto-refreshed after 4001 — scheduling reconnect');
+        scheduleReconnect();
+        return;
+      }
+
+      // Refresh failed — force re-login
+      dbg('Auth rejected (4001) — clearing stored token, prompting re-login.');
+      chrome.runtime.sendMessage({ type: 'CLEAR_AUTH_TOKEN' });
+      chrome.storage.local.remove('kenbotSession');
+      sessionId = null;
+      appendSystemMessage(
+        'Your session has expired. Please log in again via the KenBot popup.',
+        'Kipindi chako kimeisha. Tafadhali ingia tena kupitia popup ya KenBot.'
+      );
+      chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
+    })();
     return;
   }
 
@@ -186,6 +255,10 @@ function onWsError(err) {
 }
 
 function scheduleReconnect() {
+  if (!isContextValid()) {
+    dbg('Extension context invalidated — cancelling reconnect.');
+    return;
+  }
   const delay = Math.min(
     WS_RECONNECT_BASE_DELAY_MS * Math.pow(2, reconnectAttempt),
     WS_RECONNECT_MAX_DELAY_MS
@@ -210,7 +283,7 @@ function onWsMessage(event) {
  * Dispatch incoming Pilot messages to the correct handler.
  * @param {{ type: string, [key: string]: any }} msg
  */
-function handlePilotMessage(msg) {
+async function handlePilotMessage(msg) {
   switch (msg.type) {
     case 'agent_message':
       appendAgentMessage(msg.content_en, msg.content_sw);
@@ -220,11 +293,37 @@ function handlePilotMessage(msg) {
       executeAction(msg.action);
       break;
 
-    case 'pause_for_confirmation':
-      showConfirmation(msg.step_label, msg.fields_summary);
+    case 'execute_step':
+      await executeStep(msg);
+      break;
+
+    case 'pause_confirmation':
+      showConfirmation(msg.step_label, msg.fields ? msg.fields.split(',').map(f => f.trim()) : []);
+      break;
+
+    case 'await_vault_key':
+      showVaultKeyPrompt(msg.missing_keys);
+      break;
+
+    case 'open_url':
+      openPortalUrl(msg.url, msg.missing_keys);
+      break;
+
+    case 'state_update':
+      updateStatusFromState(msg.state);
+      break;
+
+    case 'session_complete':
+      appendSystemMessage('✅ Task complete!', '✅ Kazi imekamilika!');
+      hideConfirmationArea();
+      break;
+
+    case 'error':
+      appendSystemMessage(`❌ Error: ${msg.message}`, `❌ Hitilafu: ${msg.message}`);
       break;
 
     case 'captcha_detected':
+    case 'await_captcha':
       showCaptchaPrompt();
       break;
 
@@ -314,6 +413,342 @@ async function executeAction(action) {
     }
   } catch (err) {
     reportStepFailed(action.selector.primary, action.semantic_name, err.message);
+  }
+}
+
+// ─── 5b. Step-Level Orchestration ────────────────────────────────────────────
+
+/**
+ * Check whether the current page URL matches a step's url_match pattern.
+ * @param {string|null} pattern
+ * @param {string} strategy  'contains' | 'starts-with' | 'exact' | 'regex'
+ * @returns {boolean}
+ */
+function urlMatches(pattern, strategy) {
+  if (!pattern) return true;
+  const url = location.href;
+  if (strategy === 'exact') return url === pattern;
+  if (strategy === 'starts-with') return url.startsWith(pattern);
+  if (strategy === 'regex') {
+    try { return new RegExp(pattern).test(url); } catch { return false; }
+  }
+  return url.includes(pattern); // 'contains' default
+}
+
+/**
+ * Execute a single action and return a Promise.
+ * Unlike executeAction(), this does NOT send step_confirmed — the caller
+ * (executeStep) sends ONE confirmed signal after ALL actions complete.
+ * @param {object} action
+ * @returns {Promise<void>}
+ */
+async function executeActionAsync(action) {
+  if (action.required_data_key) {
+    // Fetch from vault and inject
+    const anonKey = await getAnonKey();
+    const res = await fetch(
+      `${KENBOT_BACKEND_HTTP}/api/vault/${encodeURIComponent(action.required_data_key)}/`,
+      {
+        method: 'GET',
+        headers: { 'X-Vault-Key': anonKey, 'Content-Type': 'application/json' }
+      }
+    );
+    if (!res.ok) {
+      const err = new Error(`Vault fetch failed: ${res.status}`);
+      err.selector = action.selector ? action.selector.primary : '';
+      throw err;
+    }
+    const { value } = await res.json();
+    if (action.type === 'password' || action.type === 'text') {
+      await performFillAsync(action.selector.primary, action.selector.fallbacks || [], value);
+    } else if (action.type === 'select') {
+      await performSelectAsync(action.selector.primary, action.selector.fallbacks || [], value);
+    }
+    // value leaves scope here — never sent over WS
+    return;
+  }
+
+  const sel = action.selector || {};
+  switch (action.type) {
+    case 'click':
+      await performClickAsync(sel.primary, sel.fallbacks || []);
+      break;
+    case 'text':
+    case 'password':
+      // static text fill (rare — most use vault)
+      await performFillAsync(sel.primary, sel.fallbacks || [], action.static_value || '');
+      break;
+    case 'select':
+      await performSelectAsync(sel.primary, sel.fallbacks || [], action.static_value || '');
+      break;
+    case 'checkbox':
+      await performCheckboxAsync(sel.primary, sel.fallbacks || [], !!action.checked);
+      break;
+    case 'wait':
+      await delay(action.wait_ms || 1000);
+      break;
+    case 'navigate':
+      // Save pending resume state BEFORE navigating (new page = new JS env)
+      await chrome.storage.local.set({
+        kenbotSession: {
+          sessionId,
+          pendingResume: {
+            service_id: currentServiceId,
+            step_id: currentStepId,
+            step_index: currentStepIndex + 1,
+            total_steps: currentTotalSteps
+          }
+        }
+      });
+      window.location.href = action.url;
+      await delay(2000); // allow navigation to initiate
+      break;
+    case 'scroll': {
+      const target = sel.primary ? findElement(sel.primary, sel.fallbacks || []) : null;
+      if (target) target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      else window.scrollBy(0, action.scroll_amount || 300);
+      await delay(400);
+      break;
+    }
+    default: {
+      const err = new Error(`Unknown action type: ${action.type}`);
+      err.selector = sel.primary || '';
+      throw err;
+    }
+  }
+}
+
+/**
+ * Orchestrate a full workflow step: execute each action in sequence, then
+ * report a single step_confirmed or step_failed back to the Pilot.
+ * @param {object} msg  The execute_step message from the server
+ */
+async function executeStep(msg) {
+  const stepId = msg.step_id;
+  const stepLabel = msg.step_label || stepId;
+  const actions = msg.actions || [];
+  const requiresHumanReview = !!msg.requires_human_review;
+
+  // Track workflow position for cross-origin resume
+  currentServiceId = msg.service_id || currentServiceId;
+  currentStepId = stepId;
+  currentStepIndex = msg.step_index || 0;
+  currentTotalSteps = msg.total_steps || currentTotalSteps;
+
+  dbg(
+    'executeStep', stepId,
+    'index:', msg.step_index, '/', msg.total_steps,
+    'url_match:', msg.url_match,
+    'on_correct_page:', urlMatches(msg.url_match, msg.url_match_strategy)
+  );
+
+  appendSystemMessage(`⚙️ ${stepLabel}…`, `⚙️ ${stepLabel}…`);
+
+  if (msg.requires_otp_input) {
+    const instruction = msg.human_instruction || 'A 6-digit OTP has been sent to you. Please type it here.';
+    showOtpInputPrompt(instruction, stepId, msg.otp_selector, msg.otp_submit_selector);
+    return;
+  }
+
+  if (requiresHumanReview) {
+    const instruction = msg.human_instruction || `Please complete this step manually: ${stepLabel}`;
+    showHumanInputPrompt(instruction, stepId);
+    return;
+  }
+
+  try {
+    for (const action of actions) {
+      await executeActionAsync(action);
+    }
+    dbg('executeStep complete', stepId);
+    safeSend({ type: 'step_confirmed', step_id: stepId });
+  } catch (err) {
+    dbg('executeStep error', stepId, err);
+    safeSend({
+      type: 'step_failed',
+      step_id: stepId,
+      selector: err.selector || '',
+      reason: err.message
+    });
+  }
+}
+
+// ─── 5c. Async DOM Helpers (Promise-based, no safeSend) ──────────────────────
+
+/**
+ * Show a human-instruction overlay on requires_human_review steps.
+ * Replaces the old showCaptchaPrompt() for workflow steps.
+ * @param {string} instruction  Text shown to the user (from map's human_instruction)
+ * @param {string} stepId       Current step ID (used for Forgot Password button logic)
+ */
+function showHumanInputPrompt(instruction, stepId) {
+  if (!shadow) return;
+  const area = shadow.getElementById('kb-confirmation-area');
+  if (!area) return;
+
+  // Ensure the chat panel is open so the user sees the instruction
+  const chatPanel = shadow.getElementById('kb-chat');
+  if (chatPanel) chatPanel.hidden = false;
+
+  area.innerHTML = '';
+  area.hidden = false;
+
+  const p = document.createElement('p');
+  p.className = 'kb-confirm-label';
+  p.style.whiteSpace = 'pre-wrap';
+  p.textContent = instruction;
+  area.appendChild(p);
+
+  // "Done" button — sends step_confirmed
+  const doneBtn = document.createElement('button');
+  doneBtn.className = 'kb-btn kb-btn--confirm';
+  doneBtn.textContent = 'Done / Nimekamilisha';
+  doneBtn.addEventListener('click', () => {
+    safeSend({ type: 'step_confirmed', step_id: stepId });
+    hideConfirmationArea();
+  });
+  area.appendChild(doneBtn);
+
+  // "Forgot Password" button — only on the login step
+  if (stepId === 'ecitizen_login') {
+    const forgotBtn = document.createElement('button');
+    forgotBtn.className = 'kb-btn kb-btn--cancel';
+    forgotBtn.style.marginTop = '6px';
+    forgotBtn.textContent = 'Forgot Password / Nimesahau Nywila';
+    forgotBtn.addEventListener('click', () => {
+      safeSend({ type: 'user_message', content: 'I forgot my eCitizen password, please help me reset it.' });
+      hideConfirmationArea();
+    });
+    area.appendChild(forgotBtn);
+  }
+}
+
+/**
+ * Show an OTP text-input directly in the KenBot overlay.
+ * User types the OTP → extension fills the portal field silently → submits → sends step_confirmed.
+ * @param {string} instruction       Instruction shown to user
+ * @param {string} stepId            Current step ID
+ * @param {string} otpSelector       CSS selector for the portal OTP input
+ * @param {string} submitSelector    CSS selector for the portal submit button after OTP
+ */
+function showOtpInputPrompt(instruction, stepId, otpSelector, submitSelector) {
+  if (!shadow) return;
+  const area = shadow.getElementById('kb-confirmation-area');
+  if (!area) return;
+
+  const chatPanel = shadow.getElementById('kb-chat');
+  if (chatPanel) chatPanel.hidden = false;
+
+  area.innerHTML = '';
+  area.hidden = false;
+
+  const p = document.createElement('p');
+  p.className = 'kb-confirm-label';
+  p.style.whiteSpace = 'pre-wrap';
+  p.textContent = instruction;
+  area.appendChild(p);
+
+  const otpInput = document.createElement('input');
+  otpInput.type = 'text';
+  otpInput.inputMode = 'numeric';
+  otpInput.maxLength = 6;
+  otpInput.placeholder = 'Enter 6-digit OTP';
+  otpInput.className = 'kb-otp-input';
+  otpInput.style.cssText = 'width:100%;padding:8px 10px;margin:8px 0;font-size:1.2rem;letter-spacing:0.2em;border:2px solid #0ea5e9;border-radius:6px;text-align:center;box-sizing:border-box;';
+  area.appendChild(otpInput);
+
+  const submitBtn = document.createElement('button');
+  submitBtn.className = 'kb-btn kb-btn--confirm';
+  submitBtn.textContent = 'Submit OTP';
+  submitBtn.addEventListener('click', async () => {
+    const otp = otpInput.value.trim();
+    if (!otp || otp.length < 4) {
+      otpInput.style.borderColor = '#ef4444';
+      return;
+    }
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Submitting…';
+    try {
+      if (otpSelector) {
+        await performFillAsync(otpSelector, [], otp);
+      }
+      if (submitSelector) {
+        await performClickAsync(submitSelector, []);
+      }
+      hideConfirmationArea();
+      safeSend({ type: 'step_confirmed', step_id: stepId });
+    } catch (err) {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Submit OTP';
+      otpInput.style.borderColor = '#ef4444';
+      appendSystemMessage('❌ Could not submit OTP: ' + err.message, '❌ Could not submit OTP: ' + err.message);
+    }
+  });
+  area.appendChild(submitBtn);
+
+  // Focus the input automatically
+  setTimeout(() => otpInput.focus(), 100);
+}
+
+async function performFillAsync(primary, fallbacks, value) {
+  const el = findElement(primary, fallbacks);
+  if (!el) {
+    const err = new Error('Element not found');
+    err.selector = primary;
+    throw err;
+  }
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  await delay(200);
+  const nativeSetter = Object.getOwnPropertyDescriptor(
+    el.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+    'value'
+  );
+  if (nativeSetter && nativeSetter.set) {
+    nativeSetter.set.call(el, value);
+  } else {
+    el.value = value;
+  }
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+async function performClickAsync(primary, fallbacks) {
+  const el = findElement(primary, fallbacks);
+  if (!el) {
+    const err = new Error('Element not found');
+    err.selector = primary;
+    throw err;
+  }
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  await delay(300);
+  el.click();
+  await delay(500);
+}
+
+async function performSelectAsync(primary, fallbacks, optionValue) {
+  const el = findElement(primary, fallbacks);
+  if (!el) {
+    const err = new Error('Element not found');
+    err.selector = primary;
+    throw err;
+  }
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  await delay(200);
+  el.value = optionValue;
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+async function performCheckboxAsync(primary, fallbacks, checked) {
+  const el = findElement(primary, fallbacks);
+  if (!el) {
+    const err = new Error('Element not found');
+    err.selector = primary;
+    throw err;
+  }
+  el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  await delay(200);
+  if (el.checked !== checked) {
+    el.click();
   }
 }
 
@@ -470,6 +905,30 @@ function appendSystemMessage(textEn, textSw) {
  * @param {string} textSw
  */
 function addMessage(role, textEn, textSw) {
+  _renderBubble(role, textEn, textSw);
+
+  // Persist so the chat log survives cross-origin page navigation.
+  if (isContextValid() && sessionId) {
+    chrome.storage.local.get('kenbotSession', (stored) => {
+      if (chrome.runtime.lastError) return;
+      const session = stored.kenbotSession || { sessionId };
+      const messages = session.messages || [];
+      messages.push({ role, textEn, textSw: textSw || textEn });
+      // Cap at 300 bubbles to avoid storage bloat
+      const trimmed = messages.length > 300 ? messages.slice(-300) : messages;
+      chrome.storage.local.set({ kenbotSession: { ...session, messages: trimmed } });
+    });
+  }
+}
+
+/**
+ * Render a message bubble in the shadow DOM without touching storage.
+ * Used by addMessage() and restoreChatHistory().
+ * @param {'agent'|'user'|'system'} role
+ * @param {string} textEn
+ * @param {string} textSw
+ */
+function _renderBubble(role, textEn, textSw) {
   if (!shadow) return;
   const log = shadow.getElementById('kb-messages');
   if (!log) return;
@@ -496,6 +955,25 @@ function addMessage(role, textEn, textSw) {
 
   log.appendChild(bubble);
   log.scrollTop = log.scrollHeight;
+}
+
+/**
+ * Replay persisted messages into the shadow DOM after a cross-origin navigation.
+ * Should be called once after mountOverlay() builds the chat panel.
+ */
+async function restoreChatHistory() {
+  if (!isContextValid()) return;
+  let stored;
+  try {
+    stored = await chrome.storage.local.get('kenbotSession');
+  } catch {
+    return;
+  }
+  const messages = stored.kenbotSession?.messages;
+  if (!messages || !messages.length) return;
+  for (const msg of messages) {
+    _renderBubble(msg.role, msg.textEn, msg.textSw || msg.textEn);
+  }
 }
 
 /**
@@ -602,6 +1080,41 @@ function setStatusIndicator(state) {
   dot.setAttribute('title', labels[state] || state);
 }
 
+/**
+ * Sync the status dot from an ExecutionState object sent by the server.
+ * @param {{ status: string }} state
+ */
+function updateStatusFromState(state) {
+  if (!state) return;
+  const errorStatuses = new Set(['failed', 'awaiting_healing']);
+  setStatusIndicator(errorStatuses.has(state.status) ? 'error' : 'connected');
+}
+
+/**
+ * Show a prompt instructing the user to add missing vault credentials.
+ * @param {string[]} missingKeys
+ */
+function showVaultKeyPrompt(missingKeys) {
+  const keyList = Array.isArray(missingKeys) ? missingKeys.join(', ') : String(missingKeys || '');
+  appendSystemMessage(
+    `🔑 Missing credentials: ${keyList}. Please save them via the KenBot popup.`,
+    `🔑 Taarifa zinazokosekana: ${keyList}. Tafadhali ziingize kupitia popup ya KenBot.`
+  );
+}
+
+/**
+ * Open a portal URL in a new tab and prompt the user to fill in their details.
+ * @param {string} url
+ * @param {string} missingKeys  comma-separated human-readable field names
+ */
+function openPortalUrl(url, missingKeys) {
+  window.open(url, '_blank');
+  appendSystemMessage(
+    `🌐 Portal opened. Please fill in: ${missingKeys || 'your details'}, then let me know when done.`,
+    `🌐 Portal imefunguliwa. Tafadhali jaza: ${missingKeys || 'taarifa zako'}, kisha niambie ukikamilisha.`
+  );
+}
+
 // ─── 8. Anon-Key Retrieval (via background) ─────────────────────────────────────────
 
 /**
@@ -610,6 +1123,7 @@ function setStatusIndicator(state) {
  * @returns {Promise<string>}
  */
 function getAnonKey() {
+  if (!isContextValid()) return Promise.resolve('00000000-0000-0000-0000-000000000000');
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: 'GET_ANON_KEY' }, (response) => {
       resolve(response && response.key ? response.key : '00000000-0000-0000-0000-000000000000');

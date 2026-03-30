@@ -17,6 +17,12 @@ class LoadServiceMapInput(BaseModel):
     service_id: str = Field(description="The service_id string from the ServiceMap.")
 
 
+class TriggerSurveyInput(BaseModel):
+    service_id: str = Field(description="snake_case identifier for the service, e.g. 'renew_driving_license'.")
+    service_name: str = Field(description="Human-readable service name, e.g. 'Driving Licence Renewal'.")
+    start_url: str = Field(description="The portal URL where the Surveyor should begin exploration.")
+
+
 class GetRequiredVaultKeysInput(BaseModel):
     service_id: str = Field(description="The service_id string from the ServiceMap.")
 
@@ -37,6 +43,16 @@ class ConfirmSubmissionInput(BaseModel):
     )
 
 
+class OpenPortalInput(BaseModel):
+    url: str = Field(description="The portal URL to open for the user, e.g. 'https://ecitizen.go.ke/'.")
+    missing_keys: str = Field(
+        description=(
+            "Comma-separated human-readable names of the fields the user must fill "
+            "on the portal, e.g. 'National ID, Phone Number, Driving Licence Number'."
+        )
+    )
+
+
 class ExecuteStepInput(BaseModel):
     service_id: str
     step_id: str
@@ -44,6 +60,11 @@ class ExecuteStepInput(BaseModel):
     actions_json: str = Field(
         description="JSON array of Action objects from the ServiceMap step."
     )
+
+
+class ExecuteWorkflowStepInput(BaseModel):
+    service_id: str = Field(description="The service_id string from the ServiceMap.")
+    step_id: str = Field(description="The step_id of the specific workflow step to execute.")
 
 
 # ---------------------------------------------------------------------------
@@ -61,14 +82,53 @@ _MISSING_KEY_PREFIX = "AWAIT_VAULT_KEY"
 
 @tool(args_schema=LoadServiceMapInput)
 def load_service_map(service_id: str) -> dict:
-    """Load the validated JSON service map for a given government service."""
+    """Load the validated JSON service map for a given government service.
+
+    If the map is missing, returns {"error": ..., "needs_survey": true}.
+    When you receive that response, immediately call trigger_survey to queue
+    the Surveyor — do not attempt to automate without a map.
+    """
     from maps.repository import MapRepository
 
     repo = MapRepository()
     service_map = repo.get_map(service_id)
     if service_map is None:
-        return {"error": f"No active map found for service_id: {service_id}"}
+        return {
+            "error": f"No active map found for service_id: {service_id}",
+            "needs_survey": True,
+        }
     return service_map.model_dump()
+
+
+@tool(args_schema=TriggerSurveyInput)
+def trigger_survey(service_id: str, service_name: str, start_url: str) -> str:
+    """Queue the Surveyor to crawl a government portal and build a ServiceMap.
+
+    Call this whenever load_service_map returns needs_survey=true.
+    The survey runs asynchronously; tell the user it may take 1-3 minutes
+    and that they should ask again once it completes.
+    """
+    from surveyor.tasks import survey_service
+
+    task = survey_service.delay(
+        service_id=service_id,
+        service_name=service_name,
+        start_url=start_url,
+    )
+    logger.info(
+        "Pilot queued survey task=%s service_id=%s url=%s",
+        task.id,
+        service_id,
+        start_url,
+    )
+    return (
+        f"Survey job queued (task_id={task.id}). "
+        f"The '{service_name}' service is not yet available — "
+        "the Surveyor is building its automation map right now. "
+        "This usually takes 2–5 minutes. "
+        "Please tell the user: 'This service is not available yet. "
+        "Please try again in a few minutes.'"
+    )
 
 
 @tool(args_schema=GetRequiredVaultKeysInput)
@@ -141,21 +201,27 @@ def check_missing_vault_keys(service_id: str) -> str:
     """
     # NOTE: The consumer resolves the actual user from the WebSocket scope and
     # passes it via a thread-local set before calling the agent. We read it here.
-    from pilot._session_context import get_current_user  # noqa: PLC0415
+    from pilot._session_context import get_current_anon_key  # noqa: PLC0415
 
     from maps.repository import MapRepository
     from vault.models import EncryptedVaultEntry
 
-    user = get_current_user()
+    anon_key = get_current_anon_key()
     repo = MapRepository()
     service_map = repo.get_map(service_id)
     if service_map is None:
         return f"ERROR: no map for service_id={service_id}"
 
     required = set(service_map.required_user_data)
+    # If no anon_key is present the extension hasn't connected yet — treat all
+    # keys as missing so the agent prompts the user to open the extension.
+    if not anon_key:
+        missing = sorted(required)
+        return f"{_MISSING_KEY_PREFIX}:{','.join(missing)}"
+
     stored = set(
         EncryptedVaultEntry.objects.filter(
-            user=user, vault_key__in=list(required)
+            anon_key=anon_key, vault_key__in=list(required)
         ).values_list("vault_key", flat=True)
     )
     missing = sorted(required - stored)
@@ -164,14 +230,78 @@ def check_missing_vault_keys(service_id: str) -> str:
     return f"{_MISSING_KEY_PREFIX}:{','.join(missing)}"
 
 
+@tool(args_schema=OpenPortalInput)
+def open_portal_for_user(url: str, missing_keys: str) -> str:
+    """Open a government portal URL in the user's browser so they can fill in
+    their personal details directly on the site.
+
+    Call this when check_missing_vault_keys returns missing keys AND the user
+    has not stored their credentials in the vault. The extension will open the
+    portal in the active tab. Instruct the user which fields to fill, then
+    wait for them to confirm they are done before continuing.
+    """
+    return f"OPEN_URL:{url}:{missing_keys}"
+
+
+@tool(args_schema=ExecuteWorkflowStepInput)
+def execute_workflow_step(service_id: str, step_id: str) -> str:
+    """Dispatch a single workflow step to the browser extension for execution.
+
+    The extension will fill forms, click buttons, and navigate pages as defined
+    in the step's actions. Call this immediately when check_missing_vault_keys
+    returns ALL_KEYS_PRESENT, starting with the first step_id in the workflow.
+    After receiving step_confirmed for each step, call this tool again with the
+    next step_id. Never skip steps or improvise selectors.
+    """
+    import json as _json
+
+    from maps.repository import MapRepository
+
+    repo = MapRepository()
+    service_map = repo.get_map(service_id)
+    if service_map is None:
+        return f"ERROR: no map found for service_id={service_id}"
+
+    workflow = service_map.workflow
+    step = None
+    step_index = 0
+    for i, s in enumerate(workflow):
+        if s.step_id == step_id:
+            step = s
+            step_index = i
+            break
+
+    if step is None:
+        available = [s.step_id for s in workflow]
+        return (
+            f"ERROR: step_id='{step_id}' not found in workflow for "
+            f"service_id={service_id}. Available step IDs: {available}"
+        )
+
+    payload = {
+        **step.model_dump(),
+        "step_index": step_index,
+        "total_steps": len(workflow),
+        "service_id": service_id,
+    }
+    logger.info(
+        "execute_workflow_step dispatching step_id=%s index=%d/%d service_id=%s",
+        step_id,
+        step_index,
+        len(workflow),
+        service_id,
+    )
+    return f"EXECUTE_STEP:{_json.dumps(payload)}"
+
+
 # ---------------------------------------------------------------------------
 # Exported tool list — consumed by agent.py
 # ---------------------------------------------------------------------------
 
 PILOT_TOOLS = [
     load_service_map,
-    get_required_vault_keys,
+    trigger_survey,
     request_healing,
     confirm_submission,
-    check_missing_vault_keys,
+    execute_workflow_step,
 ]

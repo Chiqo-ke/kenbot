@@ -33,7 +33,7 @@ def _get_user_from_token(raw_token: str):
         User = get_user_model()
         return User.objects.get(pk=user_id)
     except (TokenError, InvalidToken, KeyError) as exc:
-        logger.debug("WS JWT invalid: %s", exc)
+        logger.warning("WS JWT invalid: %s", exc)
         return AnonymousUser()
     except Exception as exc:
         logger.warning("WS JWT auth error: %s", exc)

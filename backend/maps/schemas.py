@@ -35,13 +35,18 @@ class ActionType(str, Enum):
     CHECKBOX = "checkbox"
     FILE_UPLOAD = "file-upload"
     WAIT = "wait"
+    NAVIGATE = "navigate"
+    SCROLL = "scroll"
 
 
 class Action(BaseModel):
     semantic_name: str = Field(
         description="Human-readable name e.g. 'national_id_field'"
     )
-    selector: Selector
+    selector: Selector | None = Field(
+        default=None,
+        description="Target element selector. Not required for navigate/scroll.",
+    )
     type: ActionType
     required_data_key: str | None = Field(
         None,
@@ -53,6 +58,10 @@ class Action(BaseModel):
     validation_hint: str | None = Field(
         None, description="e.g. 'Must be 8 digits'"
     )
+    # navigate action
+    url: str | None = Field(None, description="URL for navigate action type.")
+    # scroll action
+    scroll_amount: int | None = Field(None, description="Pixels to scroll down for scroll type.")
 
 
 class RecoveryAction(str, Enum):
@@ -82,6 +91,19 @@ class WorkflowStep(BaseModel):
     success_indicator: Selector
     error_states: list[ErrorState] = []
     requires_human_review: bool = False
+    human_instruction: str | None = Field(
+        None,
+        description="Instruction shown to user when requires_human_review=true.",
+    )
+    requires_otp_input: bool = False
+    otp_selector: str | None = Field(
+        None,
+        description="CSS selector for the OTP input field on the portal page.",
+    )
+    otp_submit_selector: str | None = Field(
+        None,
+        description="CSS selector for the submit button to click after filling OTP.",
+    )
     estimated_wait_ms: int | None = None
 
 
