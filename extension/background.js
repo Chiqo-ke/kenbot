@@ -89,6 +89,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
 
+    // Popup → background: store JWT after login
+    case 'SET_AUTH_TOKEN': {
+      chrome.storage.local.set({ kenbot_access_token: message.token, kenbot_refresh_token: message.refreshToken }, () => {
+        dbg('Auth token stored');
+        // Notify all portal content scripts so they can reconnect with the new token
+        chrome.tabs.query({}, (tabs) => {
+          tabs.forEach((tab) => {
+            if (PORTAL_PATTERNS.some((p) => tab.url && tab.url.includes(p))) {
+              chrome.tabs.sendMessage(tab.id, { type: 'AUTH_TOKEN_UPDATED', token: message.token }).catch(() => {});
+            }
+          });
+        });
+        sendResponse({ ok: true });
+      });
+      return true;
+    }
+
+    // Popup → background: retrieve stored JWT
+    case 'GET_AUTH_TOKEN': {
+      chrome.storage.local.get(['kenbot_access_token'], (result) => {
+        sendResponse({ token: result.kenbot_access_token || null });
+      });
+      return true;
+    }
+
+    // Popup → background: clear JWT on logout
+    case 'CLEAR_AUTH_TOKEN': {
+      chrome.storage.local.remove(['kenbot_access_token', 'kenbot_refresh_token'], () => {
+        dbg('Auth token cleared');
+        sendResponse({ ok: true });
+      });
+      return true;
+    }
+
     // Popup → content script: relay a user command (e.g. start task)
     case 'RELAY_TO_CONTENT': {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {

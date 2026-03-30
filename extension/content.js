@@ -111,7 +111,7 @@ function mountOverlay() {
 
 /**
  * Open (or re-open) the WebSocket connection to the Pilot.
- * No authentication required — connects directly.
+ * Fetches the stored JWT from background before connecting.
  * Uses exponential back-off on disconnect.
  */
 async function connectToPilot() {
@@ -119,7 +119,20 @@ async function connectToPilot() {
     sessionId = crypto.randomUUID();
   }
 
-  const url = `${KENBOT_WS_BASE}${sessionId}/`;
+  // Fetch JWT token from background storage
+  const tokenResult = await new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'GET_AUTH_TOKEN' }, (response) => {
+      resolve(response && response.token ? response.token : null);
+    });
+  });
+
+  if (!tokenResult) {
+    dbg('No auth token — skipping WS connect. Log in via the popup.');
+    setStatusIndicator('disconnected');
+    return;
+  }
+
+  const url = `${KENBOT_WS_BASE}${sessionId}/?token=${encodeURIComponent(tokenResult)}`;
   dbg('Connecting WebSocket to', url);
   ws = new WebSocket(url);
 
@@ -143,6 +156,23 @@ function onWsClose(event) {
 
   // Normal closure — clean exit, no reconnect
   if (event.code === 1000) {
+    chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
+    return;
+  }
+
+  // Auth failure — server explicitly rejected our token (4001).
+  // Clear the stale/expired token, reset the session ID so a fresh
+  // session is created on next login, and prompt the user to re-login.
+  // Do NOT schedule a reconnect — retrying with the same bad token is futile.
+  if (event.code === 4001) {
+    dbg('Auth rejected (4001) — clearing stored token, prompting re-login.');
+    chrome.runtime.sendMessage({ type: 'CLEAR_AUTH_TOKEN' });
+    sessionId = null;
+    setStatusIndicator('disconnected');
+    appendSystemMessage(
+      'Your session has expired. Please log in again via the KenBot popup.',
+      'Kipindi chako kimeisha. Tafadhali ingia tena kupitia popup ya KenBot.'
+    );
     chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
     return;
   }
@@ -232,7 +262,7 @@ function handlePilotMessage(msg) {
  */
 function sendUserMessage(text) {
   appendUserMessage(text);
-  safeSend({ type: 'user_message', text });
+  safeSend({ type: 'user_message', content: text });
 }
 
 /**
@@ -606,6 +636,20 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // Popup relays a direct task command
     case 'START_TASK': {
       sendUserMessage(message.text);
+      sendResponse({ ok: true });
+      break;
+    }
+    // Background notifies that a new JWT was stored — reconnect with it
+    case 'AUTH_TOKEN_UPDATED': {
+      dbg('Auth token updated — reconnecting WebSocket');
+      if (ws) {
+        ws.onclose = null; // suppress auto-reconnect from old socket
+        ws.close(1000);
+        ws = null;
+      }
+      reconnectAttempt = 0;
+      sessionId = null; // fresh session for the newly logged-in user
+      connectToPilot();
       sendResponse({ ok: true });
       break;
     }

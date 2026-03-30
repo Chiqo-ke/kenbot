@@ -55,6 +55,17 @@ class PilotConsumer(AsyncWebsocketConsumer):
         self.session_id: str = self.scope["url_route"]["kwargs"]["session_id"]
         self.user = self.scope.get("user", None)
 
+        # Reject anonymous (unauthenticated) WebSocket connections.
+        # We must accept() first so the browser receives a proper WS close
+        # frame (code 4001) rather than a raw HTTP 403 — otherwise the
+        # extension can't distinguish auth failure from network errors and
+        # will retry indefinitely with the same expired token.
+        if not self.user or not self.user.is_authenticated:
+            logger.warning("WS rejected — unauthenticated connection attempt for session=%s", self.session_id)
+            await self.accept()
+            await self.close(code=4001)
+            return
+
         await self.accept()
 
         self.state = ExecutionState()
