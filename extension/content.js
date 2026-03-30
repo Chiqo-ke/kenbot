@@ -111,7 +111,7 @@ function mountOverlay() {
 
 /**
  * Open (or re-open) the WebSocket connection to the Pilot.
- * Fetches the JWT from chrome.storage first and passes it as ?token= query param.
+ * No authentication required — connects directly.
  * Uses exponential back-off on disconnect.
  */
 async function connectToPilot() {
@@ -119,19 +119,8 @@ async function connectToPilot() {
     sessionId = crypto.randomUUID();
   }
 
-  const token = await getAuthToken();
-  if (!token) {
-    dbg('No auth token — showing login prompt, will not connect yet');
-    setStatusIndicator('disconnected');
-    appendSystemMessage(
-      'Please log in via the KenBot popup to connect.',
-      'Tafadhali ingia kupitia popup ya KenBot.'
-    );
-    return;
-  }
-
-  const url = `${KENBOT_WS_BASE}${sessionId}/?token=${encodeURIComponent(token)}`;
-  dbg('Connecting WebSocket to', url.replace(/token=.*/, 'token=***'));
+  const url = `${KENBOT_WS_BASE}${sessionId}/`;
+  dbg('Connecting WebSocket to', url);
   ws = new WebSocket(url);
 
   ws.addEventListener('open', onWsOpen);
@@ -155,26 +144,6 @@ function onWsClose(event) {
   // Normal closure — clean exit, no reconnect
   if (event.code === 1000) {
     chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
-    return;
-  }
-
-  // Auth failure — try to refresh the JWT before giving up
-  if (event.code === 4001) {
-    dbg('Auth rejected (4001) — attempting token refresh');
-    chrome.runtime.sendMessage({ type: 'REFRESH_ACCESS_TOKEN' }, (response) => {
-      if (response && response.ok) {
-        dbg('Token refreshed — reconnecting');
-        reconnectAttempt = 0;
-        setTimeout(connectToPilot, 500);
-      } else {
-        dbg('Token refresh failed (%s) — asking user to log in', response && response.reason);
-        appendSystemMessage(
-          'Session expired. Please log in again via the KenBot popup.',
-          'Kipindi kimeisha. Tafadhali ingia tena kupitia popup ya KenBot.'
-        );
-        chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
-      }
-    });
     return;
   }
 
@@ -324,18 +293,14 @@ async function executeAction(action) {
  * @param {object} action
  */
 async function injectVaultValue(action) {
-  const token = await getAuthToken();
-  if (!token) {
-    reportStepFailed(action.selector.primary, action.semantic_name, 'Not authenticated');
-    return;
-  }
+  const anonKey = await getAnonKey();
 
   const res = await fetch(
     `${KENBOT_BACKEND_HTTP}/api/vault/${encodeURIComponent(action.required_data_key)}/`,
     {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        'X-Vault-Key': anonKey,
         'Content-Type': 'application/json'
       }
     }
@@ -607,16 +572,17 @@ function setStatusIndicator(state) {
   dot.setAttribute('title', labels[state] || state);
 }
 
-// ─── 8. Auth Token Retrieval (via background) ─────────────────────────────────
+// ─── 8. Anon-Key Retrieval (via background) ─────────────────────────────────────────
 
 /**
- * Retrieve the auth token from the background service worker.
- * @returns {Promise<string|null>}
+ * Retrieve the persistent anon_key UUID from the background service worker.
+ * Used as X-Vault-Key header on all vault API calls.
+ * @returns {Promise<string>}
  */
-function getAuthToken() {
+function getAnonKey() {
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage({ type: 'GET_AUTH_TOKEN' }, (response) => {
-      resolve(response && response.token ? response.token : null);
+    chrome.runtime.sendMessage({ type: 'GET_ANON_KEY' }, (response) => {
+      resolve(response && response.key ? response.key : '00000000-0000-0000-0000-000000000000');
     });
   });
 }
@@ -640,14 +606,6 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // Popup relays a direct task command
     case 'START_TASK': {
       sendUserMessage(message.text);
-      sendResponse({ ok: true });
-      break;
-    }
-    // User just logged in — try to connect WS now
-    case 'AUTH_TOKEN_SET': {
-      dbg('Auth token set — triggering WS connect');
-      reconnectAttempt = 0;
-      connectToPilot();
       sendResponse({ ok: true });
       break;
     }

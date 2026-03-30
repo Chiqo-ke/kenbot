@@ -123,7 +123,7 @@ REST_FRAMEWORK = {
         "rest_framework.authentication.SessionAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.IsAuthenticated",
+        "rest_framework.permissions.AllowAny",
     ],
     "DEFAULT_RENDERER_CLASSES": [
         "rest_framework.renderers.JSONRenderer",
@@ -167,8 +167,9 @@ except Exception:
     GITHUB_TOKEN = ""  # No token yet — run:  python auth_github.py
 
 # GitHub Models base URL — same endpoint used by both Pilot and Surveyor.
+# The canonical GitHub Models inference endpoint (not Azure directly).
 GITHUB_MODELS_BASE_URL: str = os.environ.get(
-    "GITHUB_MODELS_BASE_URL", "https://models.inference.ai.azure.com"
+    "GITHUB_MODELS_BASE_URL", "https://models.github.ai/inference"
 )
 
 # Which model each agent uses.  Override via env var to switch models at runtime

@@ -4,7 +4,6 @@ import logging
 import uuid
 
 from rest_framework import status
-from rest_framework.permissions import IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -17,15 +16,13 @@ logger = logging.getLogger(__name__)
 
 class PilotSessionListView(APIView):
     """
-    GET  /api/pilot/sessions/  — list the current user's sessions.
+    GET  /api/pilot/sessions/  — list all sessions.
     POST /api/pilot/sessions/  — create a new session ID for the client to
                                   open a WebSocket connection with.
     """
 
-    permission_classes = [IsAuthenticated]
-
     def get(self, request: Request) -> Response:
-        sessions = PilotSession.objects.filter(user=request.user)
+        sessions = PilotSession.objects.all()
         serializer = PilotSessionSerializer(sessions, many=True)
         return Response(serializer.data)
 
@@ -33,7 +30,6 @@ class PilotSessionListView(APIView):
         session_id = uuid.uuid4()
         session = PilotSession.objects.create(
             session_id=session_id,
-            user=request.user,
             status="active",
         )
         return Response(
@@ -45,13 +41,9 @@ class PilotSessionListView(APIView):
 class PilotSessionDetailView(APIView):
     """GET /api/pilot/sessions/<session_id>/ — fetch session state."""
 
-    permission_classes = [IsAuthenticated]
-
     def get(self, request: Request, session_id: str) -> Response:
         try:
-            session = PilotSession.objects.get(
-                session_id=session_id, user=request.user
-            )
+            session = PilotSession.objects.get(session_id=session_id)
         except PilotSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},
@@ -64,13 +56,9 @@ class PilotSessionDetailView(APIView):
 class PilotSessionLogsView(APIView):
     """GET /api/pilot/sessions/<session_id>/logs/ — fetch conversation logs."""
 
-    permission_classes = [IsAuthenticated]
-
     def get(self, request: Request, session_id: str) -> Response:
         try:
-            session = PilotSession.objects.get(
-                session_id=session_id, user=request.user
-            )
+            session = PilotSession.objects.get(session_id=session_id)
         except PilotSession.DoesNotExist:
             return Response(
                 {"detail": "Session not found."},

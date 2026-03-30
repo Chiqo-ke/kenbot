@@ -8,7 +8,6 @@ from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 from langchain_core.messages import AIMessage, HumanMessage
 
-from pilot._session_context import set_current_user
 from pilot.agent import build_pilot_agent
 from pilot.state import ExecutionState
 
@@ -54,16 +53,9 @@ class PilotConsumer(AsyncWebsocketConsumer):
 
     async def connect(self) -> None:
         self.session_id: str = self.scope["url_route"]["kwargs"]["session_id"]
-        self.user = self.scope["user"]
-
-        if not self.user or not self.user.is_authenticated:
-            logger.warning("Unauthenticated WS connection attempt for session %s", str(self.session_id))
-            await self.accept()   # accept first so we can send a proper close frame
-            await self.close(code=4001)
-            return
+        self.user = self.scope.get("user", None)
 
         await self.accept()
-        set_current_user(self.user)
 
         self.state = ExecutionState()
         self.agent_executor = build_pilot_agent()
@@ -72,16 +64,14 @@ class PilotConsumer(AsyncWebsocketConsumer):
         await self._create_session_record()
 
         logger.info(
-            "PilotConsumer connected user=%s session=%s",
-            self.user.pk,
+            "PilotConsumer connected session=%s",
             self.session_id,
         )
         await self._send({"type": "state_update", "state": self.state.model_dump()})
 
     async def disconnect(self, close_code: int) -> None:
         logger.info(
-            "PilotConsumer disconnected user=%s session=%s code=%s",
-            getattr(self, "user", "?"),
+            "PilotConsumer disconnected session=%s code=%s",
             getattr(self, "session_id", "?"),
             close_code,
         )
@@ -330,11 +320,11 @@ class PilotConsumer(AsyncWebsocketConsumer):
             from openai import AsyncOpenAI
 
             client = AsyncOpenAI(
-                base_url="https://models.inference.ai.azure.com",
+                base_url=settings.GITHUB_MODELS_BASE_URL,
                 api_key=settings.GITHUB_TOKEN,
             )
             response = await client.chat.completions.create(
-                model="openai/gpt-4o-mini",
+                model=settings.KENBOT_PILOT_MODEL,
                 messages=[
                     {
                         "role": "system",
@@ -368,7 +358,7 @@ class PilotConsumer(AsyncWebsocketConsumer):
 
         PilotSession.objects.get_or_create(
             session_id=self.session_id,
-            defaults={"user": self.user, "status": "active"},
+            defaults={"status": "active"},
         )
 
     @database_sync_to_async

@@ -86,9 +86,12 @@ async def explore_portal_tool(
 
     from surveyor.agent import SurveyState, build_surveyor_graph
 
+    raw_model = settings.KENBOT_SURVEYOR_MODEL  # e.g. "openai/gpt-4o"
+    model_provider = raw_model.split("/", 1)[0] if "/" in raw_model else "openai"
     llm = init_chat_model(  # noqa: F841 — stored in state, not used directly here
-        model="openai/gpt-4o",
-        base_url="https://models.inference.ai.azure.com",
+        model=raw_model,
+        model_provider=model_provider,
+        base_url=settings.GITHUB_MODELS_BASE_URL,
         api_key=settings.GITHUB_TOKEN,
     )
 

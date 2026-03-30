@@ -68,14 +68,14 @@ def build_pilot_agent():
 
     from pilot.tools import PILOT_TOOLS
 
-    raw_model = settings.KENBOT_PILOT_MODEL
-    if "/" in raw_model:
-        model_provider, model_name = raw_model.split("/", 1)
-    else:
-        model_provider, model_name = "openai", raw_model
+    raw_model = settings.KENBOT_PILOT_MODEL  # e.g. "openai/gpt-4o-mini"
+    # Use the full "provider/model" name — the GitHub Models endpoint
+    # (models.github.ai/inference) expects the provider prefix.
+    # Extract provider only for init_chat_model's class selection logic.
+    model_provider = raw_model.split("/", 1)[0] if "/" in raw_model else "openai"
 
     llm = init_chat_model(
-        model=model_name,
+        model=raw_model,
         model_provider=model_provider,
         base_url=settings.GITHUB_MODELS_BASE_URL,
         api_key=settings.GITHUB_TOKEN,

@@ -23,7 +23,9 @@ class PilotSession(models.Model):
     session_id = models.UUIDField(default=uuid.uuid4, unique=True, db_index=True)
     user = models.ForeignKey(
         User,
-        on_delete=models.CASCADE,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
         related_name="pilot_sessions",
     )
     service_id = models.CharField(max_length=120, blank=True, default="")

@@ -22,11 +22,5 @@ def set_current_user(user: AbstractBaseUser) -> None:
     _current_user.set(user)
 
 
-def get_current_user() -> AbstractBaseUser:
-    user = _current_user.get()
-    if user is None:
-        raise RuntimeError(
-            "No current user set in session context. "
-            "PilotConsumer must call set_current_user() before running the agent."
-        )
-    return user
+def get_current_user() -> AbstractBaseUser | None:
+    return _current_user.get()

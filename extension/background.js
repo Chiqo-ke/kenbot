@@ -1,13 +1,13 @@
 // background.js — MV3 Service Worker
 // Responsibilities:
-//   - Auth token management (store/retrieve JWT from chrome.storage.local)
+//   - Anon-key management (persistent UUID per browser profile, no login required)
 //   - Message routing between popup and content scripts
 //   - Tab tracking for active portal sessions
 //   - Content script injection on demand
 //
 // NOTE: MV3 service workers are non-persistent. The WebSocket connection lives
 // in content.js (which has a persistent DOM context). The service worker handles
-// coordination and token management only.
+// coordination and anon-key management only.
 //
 // DEBUG: chrome://extensions → KenBot → "Service worker (Inspect)"
 //        Filter by "[KenBot:bg]" to see all background events.
@@ -16,47 +16,27 @@
 
 function dbg(...args) { console.debug('[KenBot:bg]', ...args); }
 
-const KENBOT_BACKEND = 'http://127.0.0.1:8000';
 const PORTAL_PATTERNS = [
   'ecitizen.go.ke',
   'ntsa.go.ke',
   'kra.go.ke'
 ];
 
-// ─── Auth Token Management ────────────────────────────────────────────────────
+// ─── Anon-Key Management ──────────────────────────────────────────────────────
 
 /**
- * Retrieve the stored JWT. Never exposes vault values — only auth tokens.
- * @returns {Promise<string|null>}
+ * Return the persistent anonymous identity UUID for this browser profile.
+ * Generated once on first call; stored in chrome.storage.local under
+ * 'kenbot_anon_key'. Sent as X-Vault-Key header on all vault API requests.
+ * @returns {Promise<string>}
  */
-async function getAuthToken() {
-  const result = await chrome.storage.local.get('kenbot_auth_token');
-  return result.kenbot_auth_token || null;
-}
-
-/**
- * Persist a JWT received from the backend login endpoint.
- * Token is stored encrypted-at-rest by the OS (chrome.storage.local is sandboxed).
- * @param {string} token
- */
-async function setAuthToken(token) {
-  await chrome.storage.local.set({ kenbot_auth_token: token });
-}
-
-/**
- * Clear auth state on logout.
- */
-async function clearAuthToken() {
-  await chrome.storage.local.remove(['kenbot_auth_token', 'kenbot_refresh_token']);
-}
-
-async function getRefreshToken() {
-  const result = await chrome.storage.local.get('kenbot_refresh_token');
-  return result.kenbot_refresh_token || null;
-}
-
-async function setRefreshToken(token) {
-  await chrome.storage.local.set({ kenbot_refresh_token: token });
+async function getAnonKey() {
+  const result = await chrome.storage.local.get('kenbot_anon_key');
+  if (result.kenbot_anon_key) return result.kenbot_anon_key;
+  const newKey = crypto.randomUUID();
+  await chrome.storage.local.set({ kenbot_anon_key: newKey });
+  dbg('Generated new anon_key', newKey);
+  return newKey;
 }
 
 // ─── Session State ────────────────────────────────────────────────────────────
@@ -103,59 +83,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
     }
 
-    // Popup → background: get/set auth token
-    case 'GET_AUTH_TOKEN': {
-      getAuthToken().then((token) => sendResponse({ token }));
-      return true;
-    }
-
-    case 'REFRESH_ACCESS_TOKEN': {
-      getRefreshToken().then(async (refresh) => {
-        if (!refresh) { sendResponse({ ok: false, reason: 'no_refresh_token' }); return; }
-        try {
-          const res = await fetch(`${KENBOT_BACKEND}/api/auth/token/refresh/`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ refresh })
-          });
-          if (!res.ok) {
-            dbg('Token refresh failed HTTP %d', res.status);
-            await clearAuthToken();
-            sendResponse({ ok: false, reason: 'refresh_failed' });
-            return;
-          }
-          const data = await res.json();
-          await setAuthToken(data.access);
-          if (data.refresh) await setRefreshToken(data.refresh);
-          dbg('Access token refreshed successfully');
-          sendResponse({ ok: true });
-        } catch (err) {
-          dbg('Token refresh network error:', err);
-          sendResponse({ ok: false, reason: err.message });
-        }
-      });
-      return true;
-    }
-
-    case 'SET_AUTH_TOKEN': {
-      const storeOps = [setAuthToken(message.token)];
-      if (message.refreshToken) storeOps.push(setRefreshToken(message.refreshToken));
-      Promise.all(storeOps).then(() => {
-        // Notify all portal tabs so their content scripts can connect WS
-        chrome.tabs.query({}, (tabs) => {
-          tabs.forEach((tab) => {
-            if (tab.id && PORTAL_PATTERNS.some((p) => tab.url && tab.url.includes(p))) {
-              chrome.tabs.sendMessage(tab.id, { type: 'AUTH_TOKEN_SET' }).catch(() => {});
-            }
-          });
-        });
-        sendResponse({ ok: true });
-      });
-      return true;
-    }
-
-    case 'CLEAR_AUTH_TOKEN': {
-      clearAuthToken().then(() => sendResponse({ ok: true }));
+    // Content/popup → background: retrieve persistent anon_key
+    case 'GET_ANON_KEY': {
+      getAnonKey().then((key) => sendResponse({ key }));
       return true;
     }
 
@@ -207,6 +137,8 @@ function broadcastToPopup(payload) {
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   if (reason === 'install') {
     dbg('Extension installed.');
+    // Pre-generate anon_key so it's ready before any portal page loads
+    getAnonKey().then((key) => dbg('Anon key ready:', key));
   }
   if (reason === 'update') {
     dbg('Extension updated.');

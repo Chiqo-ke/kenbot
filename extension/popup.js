@@ -3,7 +3,6 @@
 //
 // Responsibilities:
 //   - Show connection status (polls content script via background)
-//   - Let the user log in / log out (JWT token management via background)
 //   - Relay a quick-start task command to the active tab's content script
 //
 // DEBUG: Open the extension popup, right-click → Inspect popup → Console
@@ -13,14 +12,110 @@
 
 function dbg(...args) { console.debug('[KenBot:popup]', ...args); }
 
-const KENBOT_BACKEND_HTTP = 'http://127.0.0.1:8000';
-
 // ─── DOM refs (resolved after DOMContentLoaded) ───────────────────────────────
 let statusDot, statusText, sessionInfoEl;
 let taskForm, taskInput;
-let loginForm, usernameInput, passwordInput;
-let loggedOutView, loggedInView;
 let toastEl;
+
+// ─── Init ─────────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+  statusDot     = document.getElementById('popup-status-dot');
+  statusText    = document.getElementById('status-text');
+  sessionInfoEl = document.getElementById('session-info');
+  taskForm      = document.getElementById('task-form');
+  taskInput     = document.getElementById('task-input');
+  toastEl       = document.getElementById('toast');
+
+  taskForm.addEventListener('submit', onTaskSubmit);
+
+  refreshStatus();
+});
+
+// ─── Status Polling ───────────────────────────────────────────────────────────
+
+function refreshStatus() {
+  chrome.runtime.sendMessage({ type: 'GET_SESSION_STATUS' }, (response) => {
+    if (chrome.runtime.lastError || !response) {
+      setStatus('disconnected', 'No active portal tab');
+      return;
+    }
+    if (response.active) {
+      setStatus('connected', 'Connected');
+      showSessionId(response.sessionId);
+    } else {
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        const tab = tabs[0];
+        if (!tab) { setStatus('disconnected', 'No active tab'); return; }
+
+        chrome.tabs.sendMessage(tab.id, { type: 'GET_WS_STATUS' }, (res) => {
+          if (chrome.runtime.lastError || !res) {
+            setStatus('disconnected', 'KenBot not active on this page');
+            return;
+          }
+          const stateLabels = { 0: 'Connecting…', 1: 'Connected', 2: 'Closing…', 3: 'Disconnected' };
+          const stateClass  = res.state === 1 ? 'connected' : 'disconnected';
+          setStatus(stateClass, stateLabels[res.state] || 'Unknown');
+          if (res.state === 1) showSessionId(res.sessionId);
+        });
+      });
+    }
+  });
+}
+
+function setStatus(state, label) {
+  statusDot.className = `status-dot ${state}`;
+  statusDot.setAttribute('title', label);
+  statusText.textContent = label;
+}
+
+function showSessionId(sessionId) {
+  if (!sessionId) return;
+  sessionInfoEl.textContent = `Session: ${sessionId}`;
+  sessionInfoEl.hidden = false;
+}
+
+// ─── Quick-task Relay ─────────────────────────────────────────────────────────
+
+function onTaskSubmit(e) {
+  e.preventDefault();
+  const text = taskInput.value.trim();
+  if (!text) return;
+
+  chrome.runtime.sendMessage(
+    { type: 'RELAY_TO_CONTENT', payload: { type: 'START_TASK', text } },
+    (response) => {
+      if (chrome.runtime.lastError || !response || !response.ok) {
+        showToast('Could not send task — is this a supported portal?');
+        return;
+      }
+      taskInput.value = '';
+      showToast('Task sent to KenBot.');
+      window.close();
+    }
+  );
+}
+
+// ─── Background message listener (refresh on session change) ─────────────────
+chrome.runtime.onMessage.addListener((message) => {
+  if (message.type === 'SESSION_STARTED' || message.type === 'SESSION_ENDED') {
+    refreshStatus();
+  }
+});
+
+// ─── Toast Utility ────────────────────────────────────────────────────────────
+
+let toastTimer = null;
+
+function showToast(message, duration = 2500) {
+  if (!toastEl) return;
+  toastEl.textContent = message;
+  toastEl.classList.add('visible');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toastEl.classList.remove('visible');
+  }, duration);
+}
+
 
 // ─── Init ─────────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => {
