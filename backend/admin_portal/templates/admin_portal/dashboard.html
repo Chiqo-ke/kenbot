@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KenBot Admin Portal</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            kenya: { green: '#006600', red: '#bb0000', black: '#000000' },
+            brand: { bg: '#0f172a', card: '#1e293b', border: '#334155', muted: '#94a3b8', accent: '#22c55e' }
+          }
+        }
+      }
+    }
+  </script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/alpinejs/3.13.3/cdn.min.js"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+    .loader { border: 3px solid #334155; border-top-color: #22c55e; border-radius: 50%; width: 20px; height: 20px; animation: spin 0.8s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .badge-pending  { background:#854d0e; color:#fef9c3; }
+    .badge-running  { background:#1e40af; color:#bfdbfe; }
+    .badge-complete { background:#14532d; color:#bbf7d0; }
+    .badge-failed   { background:#7f1d1d; color:#fecaca; }
+    .badge-active   { background:#14532d; color:#bbf7d0; }
+    .badge-inactive { background:#374151; color:#9ca3af; }
+  </style>
+</head>
+<body class="bg-brand-bg text-slate-200 min-h-full" x-data="kenbot()" x-init="init()" x-cloak>
+
+<!-- ── Top nav ─────────────────────────────────────────────────────────── -->
+<header class="bg-brand-card border-b border-brand-border px-6 py-3 flex items-center justify-between sticky top-0 z-40">
+  <div class="flex items-center gap-3">
+    <span class="text-kenya-green font-black text-xl">●</span>
+    <span class="text-kenya-red font-black text-xl">●</span>
+    <span class="font-bold text-lg tracking-wide">KenBot <span class="text-brand-accent">Admin</span></span>
+  </div>
+  <div class="flex items-center gap-4">
+    <span class="text-brand-muted text-sm" x-text="user ? `Signed in as ${user}` : ''"></span>
+    <button @click="logout()" class="text-sm px-3 py-1 rounded bg-slate-700 hover:bg-slate-600 transition">Sign out</button>
+  </div>
+</header>
+
+<!-- ── Login overlay ────────────────────────────────────────────────────── -->
+<div x-show="!authenticated" class="fixed inset-0 bg-brand-bg flex items-center justify-center z-50">
+  <div class="bg-brand-card border border-brand-border rounded-2xl p-8 w-full max-w-sm shadow-2xl">
+    <div class="flex justify-center gap-2 mb-6">
+      <span class="text-kenya-green text-3xl font-black">●</span>
+      <span class="text-slate-100 text-3xl font-black">●</span>
+      <span class="text-kenya-red text-3xl font-black">●</span>
+    </div>
+    <h2 class="text-center text-xl font-bold mb-6">KenBot Admin Login</h2>
+    <div class="space-y-4">
+      <input x-model="loginForm.username" type="text" placeholder="Username" autocomplete="username"
+        class="w-full bg-brand-bg border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-accent"
+        @keyup.enter="login()" />
+      <input x-model="loginForm.password" type="password" placeholder="Password" autocomplete="current-password"
+        class="w-full bg-brand-bg border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-accent"
+        @keyup.enter="login()" />
+      <p x-show="loginError" class="text-red-400 text-xs" x-text="loginError"></p>
+      <button @click="login()" :disabled="loginLoading"
+        class="w-full bg-brand-accent hover:bg-green-400 text-black font-bold py-2 rounded-lg transition flex items-center justify-center gap-2">
+        <span x-show="loginLoading" class="loader"></span>
+        <span x-text="loginLoading ? 'Signing in…' : 'Sign in'"></span>
+      </button>
+    </div>
+    <p class="text-brand-muted text-xs text-center mt-4">Staff accounts only</p>
+  </div>
+</div>
+
+<!-- ── Main layout ──────────────────────────────────────────────────────── -->
+<div x-show="authenticated" class="flex h-[calc(100vh-56px)]">
+
+  <!-- Sidebar -->
+  <aside class="w-52 bg-brand-card border-r border-brand-border flex flex-col py-4 shrink-0">
+    <nav class="space-y-1 px-2 flex-1">
+      <template x-for="item in navItems" :key="item.id">
+        <button @click="section = item.id"
+          :class="section === item.id ? 'bg-brand-accent text-black font-semibold' : 'text-slate-300 hover:bg-slate-700'"
+          class="w-full text-left flex items-center gap-2 px-3 py-2 rounded-lg text-sm transition">
+          <span x-html="item.icon"></span>
+          <span x-text="item.label"></span>
+        </button>
+      </template>
+    </nav>
+    <div class="px-4 pb-2">
+      <p class="text-brand-muted text-xs">v1.0 · KenBot</p>
+    </div>
+  </aside>
+
+  <!-- Content -->
+  <main class="flex-1 overflow-y-auto p-6">
+
+    <!-- ── Dashboard ── -->
+    <section x-show="section === 'dashboard'">
+      <h1 class="text-2xl font-bold mb-6">Dashboard</h1>
+      <div x-show="statsLoading" class="flex gap-2 text-brand-muted"><span class="loader"></span> Loading stats…</div>
+
+      <div x-show="!statsLoading && stats" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+        <div class="bg-brand-card border border-brand-border rounded-xl p-4">
+          <p class="text-brand-muted text-xs uppercase tracking-wide mb-1">Active Maps</p>
+          <p class="text-3xl font-bold text-brand-accent" x-text="stats?.total_maps ?? '—'"></p>
+        </div>
+        <div class="bg-brand-card border border-brand-border rounded-xl p-4">
+          <p class="text-brand-muted text-xs uppercase tracking-wide mb-1">Portals</p>
+          <p class="text-3xl font-bold" x-text="stats?.total_portals ?? '—'"></p>
+        </div>
+        <div class="bg-brand-card border border-brand-border rounded-xl p-4">
+          <p class="text-brand-muted text-xs uppercase tracking-wide mb-1">Jobs Running</p>
+          <p class="text-3xl font-bold text-blue-400" x-text="stats?.survey_jobs?.running ?? '—'"></p>
+        </div>
+        <div class="bg-brand-card border border-brand-border rounded-xl p-4">
+          <p class="text-brand-muted text-xs uppercase tracking-wide mb-1">Jobs Failed</p>
+          <p class="text-3xl font-bold text-red-400" x-text="stats?.survey_jobs?.failed ?? '—'"></p>
+        </div>
+      </div>
+
+      <!-- Job status breakdown -->
+      <div x-show="!statsLoading && stats" class="bg-brand-card border border-brand-border rounded-xl p-5 mb-6">
+        <h2 class="font-semibold mb-4 text-sm uppercase tracking-wide text-brand-muted">Survey Job Status</h2>
+        <div class="flex flex-wrap gap-3">
+          <template x-for="[key, val] in Object.entries(stats?.survey_jobs ?? {})" :key="key">
+            <div x-show="key !== 'total'" class="flex items-center gap-2 bg-brand-bg rounded-lg px-4 py-2">
+              <span :class="`badge-${key}`" class="text-xs px-2 py-0.5 rounded-full font-medium capitalize" x-text="key"></span>
+              <span class="font-bold text-lg" x-text="val"></span>
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <!-- Portals list -->
+      <div x-show="!statsLoading && stats?.portals?.length" class="bg-brand-card border border-brand-border rounded-xl p-5">
+        <h2 class="font-semibold mb-3 text-sm uppercase tracking-wide text-brand-muted">Covered Portals</h2>
+        <div class="flex flex-wrap gap-2">
+          <template x-for="portal in stats?.portals ?? []" :key="portal">
+            <span class="bg-brand-bg border border-brand-border rounded-full px-3 py-1 text-sm text-brand-accent font-medium capitalize" x-text="portal"></span>
+          </template>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Maps ── -->
+    <section x-show="section === 'maps'">
+      <div class="flex items-center justify-between mb-6">
+        <h1 class="text-2xl font-bold">Service Maps</h1>
+        <button @click="loadMaps()" class="flex items-center gap-2 text-sm px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 transition">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          Refresh
+        </button>
+      </div>
+
+      <div x-show="mapsLoading" class="flex gap-2 text-brand-muted"><span class="loader"></span> Loading maps…</div>
+
+      <!-- Filter bar -->
+      <div x-show="!mapsLoading" class="flex gap-3 mb-4">
+        <input x-model="mapFilter" type="search" placeholder="Filter by name, portal, service ID…"
+          class="flex-1 bg-brand-card border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-accent" />
+        <select x-model="mapPortalFilter" class="bg-brand-card border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-accent">
+          <option value="">All portals</option>
+          <template x-for="p in uniquePortals" :key="p">
+            <option :value="p" x-text="p"></option>
+          </template>
+        </select>
+      </div>
+
+      <div x-show="!mapsLoading" class="bg-brand-card border border-brand-border rounded-xl overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="bg-brand-bg text-brand-muted uppercase text-xs">
+            <tr>
+              <th class="px-4 py-3 text-left">Service</th>
+              <th class="px-4 py-3 text-left">Portal</th>
+              <th class="px-4 py-3 text-left">Version</th>
+              <th class="px-4 py-3 text-left">Confidence</th>
+              <th class="px-4 py-3 text-left">Last Surveyed</th>
+              <th class="px-4 py-3 text-left">Status</th>
+              <th class="px-4 py-3 text-left">Actions</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-brand-border">
+            <template x-for="m in filteredMaps" :key="m.id">
+              <tr class="hover:bg-brand-bg/50 transition">
+                <td class="px-4 py-3">
+                  <p class="font-medium" x-text="m.service_name"></p>
+                  <p class="text-brand-muted text-xs" x-text="m.service_id"></p>
+                </td>
+                <td class="px-4 py-3 capitalize" x-text="m.portal"></td>
+                <td class="px-4 py-3 font-mono text-xs" x-text="m.version"></td>
+                <td class="px-4 py-3">
+                  <div class="flex items-center gap-2">
+                    <div class="w-16 bg-brand-bg rounded-full h-1.5">
+                      <div :style="`width:${(m.surveyor_confidence*100).toFixed(0)}%`"
+                        :class="m.surveyor_confidence >= 0.8 ? 'bg-brand-accent' : m.surveyor_confidence >= 0.5 ? 'bg-yellow-400' : 'bg-red-400'"
+                        class="h-1.5 rounded-full"></div>
+                    </div>
+                    <span class="text-xs" x-text="`${(m.surveyor_confidence*100).toFixed(0)}%`"></span>
+                  </div>
+                </td>
+                <td class="px-4 py-3 text-xs text-brand-muted" x-text="formatDate(m.last_surveyed)"></td>
+                <td class="px-4 py-3">
+                  <span :class="m.is_active ? 'badge-active' : 'badge-inactive'" class="text-xs px-2 py-0.5 rounded-full font-medium" x-text="m.is_active ? 'Active' : 'Inactive'"></span>
+                </td>
+                <td class="px-4 py-3">
+                  <button @click="toggleMap(m)"
+                    :class="m.is_active ? 'bg-yellow-800 hover:bg-yellow-700 text-yellow-200' : 'bg-green-900 hover:bg-green-800 text-green-200'"
+                    class="text-xs px-3 py-1 rounded-lg transition"
+                    x-text="m.is_active ? 'Deactivate' : 'Activate'"></button>
+                </td>
+              </tr>
+            </template>
+            <tr x-show="filteredMaps.length === 0">
+              <td colspan="7" class="px-4 py-8 text-center text-brand-muted">No maps match your filter.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── Explorer (trigger surveyor) ── -->
+    <section x-show="section === 'explorer'">
+      <h1 class="text-2xl font-bold mb-2">Explorer Agent</h1>
+      <p class="text-brand-muted text-sm mb-6">Queue the Surveyor agent to map a new or existing government portal service.</p>
+
+      <!-- Trigger form -->
+      <div class="bg-brand-card border border-brand-border rounded-xl p-6 mb-8 max-w-xl">
+        <h2 class="font-semibold mb-4">Initiate New Survey</h2>
+        <div class="space-y-4">
+          <div>
+            <label class="block text-xs text-brand-muted mb-1 uppercase tracking-wide">Service ID <span class="text-red-400">*</span></label>
+            <input x-model="triggerForm.service_id" type="text" placeholder="e.g. ecitizen_good_conduct"
+              class="w-full bg-brand-bg border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-accent font-mono" />
+            <p class="text-brand-muted text-xs mt-0.5">Lowercase snake_case. Matches existing service_id to update.</p>
+          </div>
+          <div>
+            <label class="block text-xs text-brand-muted mb-1 uppercase tracking-wide">Service Name <span class="text-red-400">*</span></label>
+            <input x-model="triggerForm.service_name" type="text" placeholder="e.g. Good Conduct Certificate"
+              class="w-full bg-brand-bg border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-accent" />
+          </div>
+          <div>
+            <label class="block text-xs text-brand-muted mb-1 uppercase tracking-wide">Start URL <span class="text-red-400">*</span></label>
+            <input x-model="triggerForm.start_url" type="url" placeholder="https://ecitizen.go.ke/..."
+              class="w-full bg-brand-bg border border-brand-border rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-brand-accent font-mono" />
+          </div>
+
+          <!-- Preset quick-fill buttons -->
+          <div>
+            <label class="block text-xs text-brand-muted mb-2 uppercase tracking-wide">Quick Fill</label>
+            <div class="flex flex-wrap gap-2">
+              <template x-for="preset in presets" :key="preset.service_id">
+                <button @click="fillPreset(preset)"
+                  class="text-xs px-3 py-1.5 bg-brand-bg border border-brand-border hover:border-brand-accent rounded-lg transition capitalize"
+                  x-text="preset.label"></button>
+              </template>
+            </div>
+          </div>
+
+          <p x-show="triggerError" class="text-red-400 text-xs" x-text="triggerError"></p>
+          <p x-show="triggerSuccess" class="text-green-400 text-xs" x-text="triggerSuccess"></p>
+
+          <button @click="triggerSurvey()" :disabled="triggerLoading"
+            class="w-full bg-brand-accent hover:bg-green-400 text-black font-bold py-2.5 rounded-lg transition flex items-center justify-center gap-2">
+            <span x-show="triggerLoading" class="loader"></span>
+            <svg x-show="!triggerLoading" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+            </svg>
+            <span x-text="triggerLoading ? 'Queueing…' : 'Launch Explorer'"></span>
+          </button>
+        </div>
+      </div>
+
+      <!-- Job history -->
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="font-semibold">Survey Job History</h2>
+        <button @click="loadJobs()" class="flex items-center gap-1 text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 transition">
+          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+          Refresh
+        </button>
+      </div>
+
+      <div x-show="jobsLoading" class="flex gap-2 text-brand-muted text-sm"><span class="loader"></span> Loading jobs…</div>
+
+      <div x-show="!jobsLoading" class="bg-brand-card border border-brand-border rounded-xl overflow-hidden">
+        <table class="w-full text-sm">
+          <thead class="bg-brand-bg text-brand-muted uppercase text-xs">
+            <tr>
+              <th class="px-4 py-3 text-left">Service</th>
+              <th class="px-4 py-3 text-left">Status</th>
+              <th class="px-4 py-3 text-left">Confidence</th>
+              <th class="px-4 py-3 text-left">Issues</th>
+              <th class="px-4 py-3 text-left">Started</th>
+              <th class="px-4 py-3 text-left">Task ID</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-brand-border">
+            <template x-for="j in jobs" :key="j.id">
+              <tr class="hover:bg-brand-bg/50 transition">
+                <td class="px-4 py-3">
+                  <p class="font-medium" x-text="j.service_name"></p>
+                  <p class="text-brand-muted text-xs" x-text="j.service_id"></p>
+                </td>
+                <td class="px-4 py-3">
+                  <span :class="`badge-${j.status}`" class="text-xs px-2 py-0.5 rounded-full font-medium capitalize" x-text="j.status"></span>
+                </td>
+                <td class="px-4 py-3 text-xs" x-text="j.result ? `${(j.result.confidence * 100).toFixed(0)}%` : '—'"></td>
+                <td class="px-4 py-3">
+                  <span x-show="j.validation_issues?.length"
+                    class="text-xs px-2 py-0.5 bg-yellow-900 text-yellow-200 rounded-full"
+                    x-text="`${j.validation_issues.length} issue${j.validation_issues.length > 1 ? 's' : ''}`"></span>
+                  <span x-show="!j.validation_issues?.length" class="text-brand-muted text-xs">—</span>
+                </td>
+                <td class="px-4 py-3 text-xs text-brand-muted" x-text="formatDate(j.created_at)"></td>
+                <td class="px-4 py-3 font-mono text-xs text-brand-muted" x-text="j.celery_task_id.slice(0, 8) + '…'"></td>
+              </tr>
+            </template>
+            <tr x-show="jobs.length === 0">
+              <td colspan="6" class="px-4 py-8 text-center text-brand-muted">No survey jobs yet.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Toast notification -->
+<div x-show="toast.visible" x-transition
+  :class="toast.type === 'error' ? 'bg-red-900 border-red-700 text-red-200' : 'bg-green-900 border-green-700 text-green-200'"
+  class="fixed bottom-6 right-6 border rounded-xl px-5 py-3 text-sm shadow-2xl z-50 max-w-sm"
+  x-text="toast.message"></div>
+
+<script>
+  const API = '';  // same-origin
+
+  function kenbot() {
+    return {
+      // ── Auth ──────────────────────────────────────────
+      authenticated: false,
+      user: null,
+      token: null,
+      loginForm: { username: '', password: '' },
+      loginError: '',
+      loginLoading: false,
+
+      // ── Navigation ────────────────────────────────────
+      section: 'dashboard',
+      navItems: [
+        { id: 'dashboard', label: 'Dashboard',  icon: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/></svg>' },
+        { id: 'maps',      label: 'Maps',       icon: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/></svg>' },
+        { id: 'explorer',  label: 'Explorer',   icon: '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>' },
+      ],
+
+      // ── Dashboard stats ───────────────────────────────
+      stats: null,
+      statsLoading: false,
+
+      // ── Maps ──────────────────────────────────────────
+      maps: [],
+      mapsLoading: false,
+      mapFilter: '',
+      mapPortalFilter: '',
+
+      // ── Jobs ──────────────────────────────────────────
+      jobs: [],
+      jobsLoading: false,
+
+      // ── Explorer trigger ──────────────────────────────
+      triggerForm: { service_id: '', service_name: '', start_url: '' },
+      triggerError: '',
+      triggerSuccess: '',
+      triggerLoading: false,
+
+      presets: [
+        { label: 'eCitizen Good Conduct', service_id: 'ecitizen_good_conduct', service_name: 'Good Conduct Certificate', start_url: 'https://ecitizen.go.ke/index.php/component/findex?view=goodConduct' },
+        { label: 'eCitizen Driving Licence', service_id: 'ecitizen_driving_license_renewal', service_name: 'Driving Licence Renewal', start_url: 'https://ecitizen.go.ke/index.php/component/findex?view=drivingLicRenewal' },
+        { label: 'KRA PIN Registration', service_id: 'kra_pin_registration', service_name: 'KRA PIN Registration', start_url: 'https://itax.kra.go.ke/KRA-Portal/pinCheckerIframe.htm' },
+        { label: 'NTSA TIMS Login', service_id: 'ntsa_tims_login', service_name: 'NTSA TIMS Login', start_url: 'https://tims.ntsa.go.ke/' },
+      ],
+
+      // ── Toast ─────────────────────────────────────────
+      toast: { visible: false, message: '', type: 'success' },
+      _toastTimer: null,
+
+      // ────────────────────────────────────────────────────────────── 
+      init() {
+        const saved = sessionStorage.getItem('kb_admin_token');
+        const savedUser = sessionStorage.getItem('kb_admin_user');
+        if (saved) {
+          this.token = saved;
+          this.user = savedUser;
+          this.authenticated = true;
+          this.onAuthenticated();
+        }
+      },
+
+      async login() {
+        this.loginError = '';
+        if (!this.loginForm.username || !this.loginForm.password) {
+          this.loginError = 'Please enter username and password.';
+          return;
+        }
+        this.loginLoading = true;
+        try {
+          const resp = await fetch(`${API}/api/auth/token/`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(this.loginForm),
+          });
+          if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            this.loginError = err.detail ?? `Login failed (HTTP ${resp.status}).`;
+            return;
+          }
+          const data = await resp.json();
+          // Verify this is a staff account before proceeding
+          const meResp = await fetch(`${API}/api/admin/stats/`, {
+            headers: { Authorization: `Bearer ${data.access}` },
+          });
+          if (meResp.status === 403) {
+            this.loginError = 'Access denied. Staff accounts only.';
+            return;
+          }
+          if (!meResp.ok) {
+            this.loginError = `Auth check failed (HTTP ${meResp.status}).`;
+            return;
+          }
+          this.token = data.access;
+          this.user = this.loginForm.username;
+          sessionStorage.setItem('kb_admin_token', this.token);
+          sessionStorage.setItem('kb_admin_user', this.user);
+          this.authenticated = true;
+          this.onAuthenticated();
+        } catch (e) {
+          this.loginError = 'Network error. Is the server running?';
+        } finally {
+          this.loginLoading = false;
+        }
+      },
+
+      logout() {
+        sessionStorage.removeItem('kb_admin_token');
+        sessionStorage.removeItem('kb_admin_user');
+        this.token = null;
+        this.user = null;
+        this.authenticated = false;
+        this.stats = null;
+        this.maps = [];
+        this.jobs = [];
+      },
+
+      onAuthenticated() {
+        this.loadStats();
+        this.loadMaps();
+        this.loadJobs();
+      },
+
+      async apiFetch(path, options = {}) {
+        const resp = await fetch(`${API}${path}`, {
+          ...options,
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.token}`,
+            ...(options.headers ?? {}),
+          },
+        });
+        if (resp.status === 401) {
+          this.logout();
+          throw new Error('Session expired. Please log in again.');
+        }
+        return resp;
+      },
+
+      async loadStats() {
+        this.statsLoading = true;
+        try {
+          const resp = await this.apiFetch('/api/admin/stats/');
+          if (resp.ok) this.stats = await resp.json();
+          else this.showToast('Failed to load stats.', 'error');
+        } catch (e) {
+          this.showToast(e.message ?? 'Network error.', 'error');
+        } finally {
+          this.statsLoading = false;
+        }
+      },
+
+      async loadMaps() {
+        this.mapsLoading = true;
+        try {
+          const resp = await this.apiFetch('/api/admin/maps/');
+          if (resp.ok) this.maps = await resp.json();
+          else this.showToast('Failed to load maps.', 'error');
+        } catch (e) {
+          this.showToast(e.message ?? 'Network error.', 'error');
+        } finally {
+          this.mapsLoading = false;
+        }
+      },
+
+      async toggleMap(m) {
+        try {
+          const resp = await this.apiFetch(`/api/admin/maps/${m.id}/toggle/`, { method: 'POST' });
+          if (resp.ok) {
+            const updated = await resp.json();
+            m.is_active = updated.is_active;
+            this.showToast(`${m.service_id} ${updated.is_active ? 'activated' : 'deactivated'}.`);
+            this.loadStats();
+          } else {
+            this.showToast('Toggle failed.', 'error');
+          }
+        } catch (e) {
+          this.showToast(e.message ?? 'Network error.', 'error');
+        }
+      },
+
+      async loadJobs() {
+        this.jobsLoading = true;
+        try {
+          const resp = await this.apiFetch('/api/admin/jobs/');
+          if (resp.ok) this.jobs = await resp.json();
+          else this.showToast('Failed to load jobs.', 'error');
+        } catch (e) {
+          this.showToast(e.message ?? 'Network error.', 'error');
+        } finally {
+          this.jobsLoading = false;
+        }
+      },
+
+      async triggerSurvey() {
+        this.triggerError = '';
+        this.triggerSuccess = '';
+        const { service_id, service_name, start_url } = this.triggerForm;
+        if (!service_id || !service_name || !start_url) {
+          this.triggerError = 'All three fields are required.';
+          return;
+        }
+        this.triggerLoading = true;
+        try {
+          const resp = await this.apiFetch('/api/admin/trigger/', {
+            method: 'POST',
+            body: JSON.stringify({ service_id, service_name, start_url }),
+          });
+          const data = await resp.json();
+          if (resp.ok) {
+            this.triggerSuccess = `Job queued! Task ID: ${data.task_id}`;
+            this.showToast(`Survey queued for "${service_name}".`);
+            this.triggerForm = { service_id: '', service_name: '', start_url: '' };
+            setTimeout(() => this.loadJobs(), 1500);
+          } else {
+            this.triggerError = data.detail ?? `Error ${resp.status}.`;
+          }
+        } catch (e) {
+          this.triggerError = e.message ?? 'Network error.';
+        } finally {
+          this.triggerLoading = false;
+        }
+      },
+
+      fillPreset(preset) {
+        this.triggerForm = {
+          service_id: preset.service_id,
+          service_name: preset.service_name,
+          start_url: preset.start_url,
+        };
+        this.triggerError = '';
+        this.triggerSuccess = '';
+      },
+
+      get filteredMaps() {
+        const q = this.mapFilter.toLowerCase();
+        const p = this.mapPortalFilter;
+        return this.maps.filter(m =>
+          (!p || m.portal === p) &&
+          (!q || m.service_name.toLowerCase().includes(q) ||
+                 m.service_id.toLowerCase().includes(q) ||
+                 m.portal.toLowerCase().includes(q))
+        );
+      },
+
+      get uniquePortals() {
+        return [...new Set(this.maps.map(m => m.portal))].sort();
+      },
+
+      formatDate(iso) {
+        if (!iso) return '—';
+        const d = new Date(iso);
+        return d.toLocaleDateString('en-KE', { month: 'short', day: 'numeric', year: 'numeric' }) +
+               ' ' + d.toLocaleTimeString('en-KE', { hour: '2-digit', minute: '2-digit' });
+      },
+
+      showToast(message, type = 'success') {
+        clearTimeout(this._toastTimer);
+        this.toast = { visible: true, message, type };
+        this._toastTimer = setTimeout(() => { this.toast.visible = false; }, 4000);
+      },
+    };
+  }
+</script>
+</body>
+</html>

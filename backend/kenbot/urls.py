@@ -12,4 +12,6 @@ urlpatterns = [
     path("api/maps/", include("maps.urls")),
     path("api/vault/", include("vault.urls")),
     path("api/surveyor/", include("surveyor.urls")),
+    # Admin portal (SPA + REST)
+    path("", include("admin_portal.urls")),
 ]

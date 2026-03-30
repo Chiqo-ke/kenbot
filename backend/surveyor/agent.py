@@ -41,8 +41,15 @@ def _get_llm():
     """Return the GPT-4o model via GitHub Models endpoint."""
     from django.conf import settings
 
+    raw_model = "openai/gpt-4o"
+    if "/" in raw_model:
+        model_provider, model_name = raw_model.split("/", 1)
+    else:
+        model_provider, model_name = "openai", raw_model
+
     return init_chat_model(
-        model="openai/gpt-4o",
+        model=model_name,
+        model_provider=model_provider,
         base_url="https://models.inference.ai.azure.com",
         api_key=settings.GITHUB_TOKEN,
     )

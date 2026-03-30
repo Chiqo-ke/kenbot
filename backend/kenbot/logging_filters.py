@@ -26,11 +26,14 @@ class MaskVaultFilter(logging.Filter):
                 record.msg = pattern.sub("[REDACTED]", record.msg)
         if record.args:
             try:
-                sanitised = tuple(
-                    re.sub(p.pattern, "[REDACTED]", str(a)) if isinstance(a, str) else a
-                    for a in record.args  # type: ignore[union-attr]
-                    for p in _SENSITIVE_PATTERNS
-                )
+                def _sanitise(a: object) -> object:
+                    if not isinstance(a, str):
+                        return a
+                    for p in _SENSITIVE_PATTERNS:
+                        a = p.sub("[REDACTED]", a)
+                    return a
+
+                sanitised = tuple(_sanitise(a) for a in record.args)  # type: ignore[union-attr]
                 record.args = sanitised
             except TypeError:
                 pass

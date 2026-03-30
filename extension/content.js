@@ -16,8 +16,16 @@
 
 'use strict';
 
-const KENBOT_BACKEND_HTTP = 'https://your-kenbot-backend.com';
-const KENBOT_WS_URL = 'wss://your-kenbot-backend.com/ws/pilot/';
+// ─── Debug Logger ─────────────────────────────────────────────────────────────
+// Logs are visible in DevTools → the tab's console (not the extension console).
+// Open DevTools on any portal page and filter by "[KenBot]" to see all events.
+const DBG = true; // set to false to silence in production
+function dbg(...args) {
+  if (DBG) console.debug('[KenBot:content]', ...args);
+}
+
+const KENBOT_BACKEND_HTTP = 'http://127.0.0.1:8000';
+const KENBOT_WS_BASE = 'ws://127.0.0.1:8000/ws/pilot/';
 const WS_RECONNECT_BASE_DELAY_MS = 1500;
 const WS_RECONNECT_MAX_DELAY_MS = 30000;
 
@@ -103,14 +111,27 @@ function mountOverlay() {
 
 /**
  * Open (or re-open) the WebSocket connection to the Pilot.
+ * Fetches the JWT from chrome.storage first and passes it as ?token= query param.
  * Uses exponential back-off on disconnect.
  */
-function connectToPilot() {
+async function connectToPilot() {
   if (!sessionId) {
     sessionId = crypto.randomUUID();
   }
 
-  const url = `${KENBOT_WS_URL}${sessionId}/`;
+  const token = await getAuthToken();
+  if (!token) {
+    dbg('No auth token — showing login prompt, will not connect yet');
+    setStatusIndicator('disconnected');
+    appendSystemMessage(
+      'Please log in via the KenBot popup to connect.',
+      'Tafadhali ingia kupitia popup ya KenBot.'
+    );
+    return;
+  }
+
+  const url = `${KENBOT_WS_BASE}${sessionId}/?token=${encodeURIComponent(token)}`;
+  dbg('Connecting WebSocket to', url.replace(/token=.*/, 'token=***'));
   ws = new WebSocket(url);
 
   ws.addEventListener('open', onWsOpen);
@@ -121,25 +142,47 @@ function connectToPilot() {
 
 function onWsOpen() {
   reconnectAttempt = 0;
+  dbg('WebSocket opened session=%s', sessionId);
   setStatusIndicator('connected');
   chrome.runtime.sendMessage({ type: 'SESSION_STARTED', sessionId });
   appendSystemMessage('Connected to KenBot. How can I help you?', 'Imeunganishwa na KenBot. Naweza kukusaidia?');
 }
 
 function onWsClose(event) {
+  dbg('WebSocket closed code=%d reason=%s', event.code, event.reason || '(none)');
   setStatusIndicator('disconnected');
-  // Do not reconnect on normal closure (code 1000) or auth failure (4001)
-  if (event.code === 1000 || event.code === 4001) {
-    if (event.code === 4001) {
-      appendSystemMessage('Session expired. Please log in again.', 'Kipindi kimeisha. Tafadhali ingia tena.');
-    }
+
+  // Normal closure — clean exit, no reconnect
+  if (event.code === 1000) {
     chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
     return;
   }
+
+  // Auth failure — try to refresh the JWT before giving up
+  if (event.code === 4001) {
+    dbg('Auth rejected (4001) — attempting token refresh');
+    chrome.runtime.sendMessage({ type: 'REFRESH_ACCESS_TOKEN' }, (response) => {
+      if (response && response.ok) {
+        dbg('Token refreshed — reconnecting');
+        reconnectAttempt = 0;
+        setTimeout(connectToPilot, 500);
+      } else {
+        dbg('Token refresh failed (%s) — asking user to log in', response && response.reason);
+        appendSystemMessage(
+          'Session expired. Please log in again via the KenBot popup.',
+          'Kipindi kimeisha. Tafadhali ingia tena kupitia popup ya KenBot.'
+        );
+        chrome.runtime.sendMessage({ type: 'SESSION_ENDED' });
+      }
+    });
+    return;
+  }
+
   scheduleReconnect();
 }
 
-function onWsError() {
+function onWsError(err) {
+  dbg('WebSocket error', err);
   setStatusIndicator('error');
 }
 
@@ -597,6 +640,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     // Popup relays a direct task command
     case 'START_TASK': {
       sendUserMessage(message.text);
+      sendResponse({ ok: true });
+      break;
+    }
+    // User just logged in — try to connect WS now
+    case 'AUTH_TOKEN_SET': {
+      dbg('Auth token set — triggering WS connect');
+      reconnectAttempt = 0;
+      connectToPilot();
       sendResponse({ ok: true });
       break;
     }

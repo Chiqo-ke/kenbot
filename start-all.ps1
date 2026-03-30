@@ -64,9 +64,9 @@ if ($noRedis) {
 
 Start-Sleep -Milliseconds 500
 
-# ---- 3. Django / Daphne -----------------------------------------------------
+# ---- 3. Django / uvicorn ----------------------------------------------------
 Write-Host ""
-Write-Host "== 3/3  Django (Daphne) ==" -ForegroundColor Cyan
+Write-Host "== 3/3  Django (uvicorn) ==" -ForegroundColor Cyan
 Write-Host "  Starting Django in this window (Ctrl+C to stop)..."
 Write-Host ""
 

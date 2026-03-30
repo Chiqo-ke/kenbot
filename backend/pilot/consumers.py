@@ -57,7 +57,8 @@ class PilotConsumer(AsyncWebsocketConsumer):
         self.user = self.scope["user"]
 
         if not self.user or not self.user.is_authenticated:
-            logger.warning("Unauthenticated WS connection attempt for session %s", self.session_id)
+            logger.warning("Unauthenticated WS connection attempt for session %s", str(self.session_id))
+            await self.accept()   # accept first so we can send a proper close frame
             await self.close(code=4001)
             return
 

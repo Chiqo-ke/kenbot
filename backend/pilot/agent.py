@@ -68,8 +68,15 @@ def build_pilot_agent():
 
     from pilot.tools import PILOT_TOOLS
 
+    raw_model = settings.KENBOT_PILOT_MODEL
+    if "/" in raw_model:
+        model_provider, model_name = raw_model.split("/", 1)
+    else:
+        model_provider, model_name = "openai", raw_model
+
     llm = init_chat_model(
-        model=settings.KENBOT_PILOT_MODEL,
+        model=model_name,
+        model_provider=model_provider,
         base_url=settings.GITHUB_MODELS_BASE_URL,
         api_key=settings.GITHUB_TOKEN,
     )

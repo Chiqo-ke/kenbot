@@ -5,10 +5,15 @@
 //   - Show connection status (polls content script via background)
 //   - Let the user log in / log out (JWT token management via background)
 //   - Relay a quick-start task command to the active tab's content script
+//
+// DEBUG: Open the extension popup, right-click → Inspect popup → Console
+//        Filter by "[KenBot:popup]" to see all events.
 
 'use strict';
 
-const KENBOT_BACKEND_HTTP = 'https://your-kenbot-backend.com';
+function dbg(...args) { console.debug('[KenBot:popup]', ...args); }
+
+const KENBOT_BACKEND_HTTP = 'http://127.0.0.1:8000';
 
 // ─── DOM refs (resolved after DOMContentLoaded) ───────────────────────────────
 let statusDot, statusText, sessionInfoEl;
@@ -110,6 +115,8 @@ async function onLoginSubmit(e) {
     return;
   }
 
+  dbg('Attempting login for', username, '→', `${KENBOT_BACKEND_HTTP}/api/auth/token/`);
+
   try {
     const res = await fetch(`${KENBOT_BACKEND_HTTP}/api/auth/token/`, {
       method: 'POST',
@@ -117,21 +124,29 @@ async function onLoginSubmit(e) {
       body: JSON.stringify({ username, password })
     });
 
+    dbg('Login response status:', res.status);
+
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      showToast(err.detail || 'Login failed. Check your credentials.');
+      dbg('Login error body:', err);
+      showToast(err.detail || `Login failed (HTTP ${res.status}). Check credentials.`);
       return;
     }
 
-    const { access } = await res.json();
-    chrome.runtime.sendMessage({ type: 'SET_AUTH_TOKEN', token: access }, () => {
+    const data = await res.json();
+    dbg('Login success — storing token');
+    const { access, refresh } = data;
+    chrome.runtime.sendMessage({ type: 'SET_AUTH_TOKEN', token: access, refreshToken: refresh }, () => {
       passwordInput.value = ''; // Clear password from DOM
       loggedOutView.hidden = true;
       loggedInView.hidden  = false;
       showToast('Logged in successfully.');
+      // Refresh status after a short delay to give content script time to connect
+      setTimeout(refreshStatus, 1500);
     });
-  } catch {
-    showToast('Network error. Is the backend running?');
+  } catch (err) {
+    dbg('Login fetch error:', err);
+    showToast(`Network error: ${err.message}. Is the backend running on port 8000?`);
   }
 }
 

@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     "pilot",
     "maps",
     "vault",
+    "admin_portal",
 ]
 
 MIDDLEWARE = [

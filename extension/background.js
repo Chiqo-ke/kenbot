@@ -8,10 +8,15 @@
 // NOTE: MV3 service workers are non-persistent. The WebSocket connection lives
 // in content.js (which has a persistent DOM context). The service worker handles
 // coordination and token management only.
+//
+// DEBUG: chrome://extensions → KenBot → "Service worker (Inspect)"
+//        Filter by "[KenBot:bg]" to see all background events.
 
 'use strict';
 
-const KENBOT_BACKEND = 'https://your-kenbot-backend.com';
+function dbg(...args) { console.debug('[KenBot:bg]', ...args); }
+
+const KENBOT_BACKEND = 'http://127.0.0.1:8000';
 const PORTAL_PATTERNS = [
   'ecitizen.go.ke',
   'ntsa.go.ke',
@@ -42,7 +47,16 @@ async function setAuthToken(token) {
  * Clear auth state on logout.
  */
 async function clearAuthToken() {
-  await chrome.storage.local.remove('kenbot_auth_token');
+  await chrome.storage.local.remove(['kenbot_auth_token', 'kenbot_refresh_token']);
+}
+
+async function getRefreshToken() {
+  const result = await chrome.storage.local.get('kenbot_refresh_token');
+  return result.kenbot_refresh_token || null;
+}
+
+async function setRefreshToken(token) {
+  await chrome.storage.local.set({ kenbot_refresh_token: token });
 }
 
 // ─── Session State ────────────────────────────────────────────────────────────
@@ -70,6 +84,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // Content script → background: register a new session
     case 'SESSION_STARTED': {
+      dbg('Session started tabId=%d sessionId=%s', sender.tab && sender.tab.id, message.sessionId);
       if (sender.tab) {
         activeSessions.set(sender.tab.id, message.sessionId);
         broadcastToPopup({ type: 'SESSION_STARTED', sessionId: message.sessionId });
@@ -94,8 +109,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
     }
 
+    case 'REFRESH_ACCESS_TOKEN': {
+      getRefreshToken().then(async (refresh) => {
+        if (!refresh) { sendResponse({ ok: false, reason: 'no_refresh_token' }); return; }
+        try {
+          const res = await fetch(`${KENBOT_BACKEND}/api/auth/token/refresh/`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ refresh })
+          });
+          if (!res.ok) {
+            dbg('Token refresh failed HTTP %d', res.status);
+            await clearAuthToken();
+            sendResponse({ ok: false, reason: 'refresh_failed' });
+            return;
+          }
+          const data = await res.json();
+          await setAuthToken(data.access);
+          if (data.refresh) await setRefreshToken(data.refresh);
+          dbg('Access token refreshed successfully');
+          sendResponse({ ok: true });
+        } catch (err) {
+          dbg('Token refresh network error:', err);
+          sendResponse({ ok: false, reason: err.message });
+        }
+      });
+      return true;
+    }
+
     case 'SET_AUTH_TOKEN': {
-      setAuthToken(message.token).then(() => sendResponse({ ok: true }));
+      const storeOps = [setAuthToken(message.token)];
+      if (message.refreshToken) storeOps.push(setRefreshToken(message.refreshToken));
+      Promise.all(storeOps).then(() => {
+        // Notify all portal tabs so their content scripts can connect WS
+        chrome.tabs.query({}, (tabs) => {
+          tabs.forEach((tab) => {
+            if (tab.id && PORTAL_PATTERNS.some((p) => tab.url && tab.url.includes(p))) {
+              chrome.tabs.sendMessage(tab.id, { type: 'AUTH_TOKEN_SET' }).catch(() => {});
+            }
+          });
+        });
+        sendResponse({ ok: true });
+      });
       return true;
     }
 
@@ -151,9 +206,13 @@ function broadcastToPopup(payload) {
 // ─── Install / Update Lifecycle ──────────────────────────────────────────────
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   if (reason === 'install') {
-    console.log('[KenBot] Extension installed.');
+    dbg('Extension installed.');
   }
   if (reason === 'update') {
-    console.log('[KenBot] Extension updated.');
+    dbg('Extension updated.');
   }
 });
+
+// Log unhandled errors in the service worker
+self.addEventListener('error', (e) => dbg('SW error:', e.message));
+self.addEventListener('unhandledrejection', (e) => dbg('SW unhandled rejection:', e.reason));
