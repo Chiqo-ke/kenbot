@@ -38,3 +38,18 @@ def set_current_anon_key(anon_key: str) -> None:
 
 def get_current_anon_key() -> str | None:
     return _current_anon_key.get()
+
+
+# Latest heartbeat snapshot — set by the consumer before invoking the agent
+# so that the explore_page tool can surface it without a WS round-trip.
+_current_heartbeat: contextvars.ContextVar[dict] = contextvars.ContextVar(
+    "_current_heartbeat", default={}
+)
+
+
+def set_current_heartbeat(data: dict) -> None:
+    _current_heartbeat.set(data)
+
+
+def get_current_heartbeat() -> dict:
+    return _current_heartbeat.get()

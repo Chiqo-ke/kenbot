@@ -125,6 +125,8 @@ class PilotConsumer(AsyncWebsocketConsumer):
             "user_form_filled": self._handle_user_form_filled,
             "confirmation_response": self._handle_confirmation_response,
             "resume_workflow": self._handle_resume_workflow,
+            "subgoal_selected": self._handle_subgoal_selected,
+            "heartbeat": self._handle_heartbeat,
         }
 
         handler = handlers.get(msg_type)
@@ -164,6 +166,24 @@ class PilotConsumer(AsyncWebsocketConsumer):
     async def _handle_step_confirmed(self, data: dict) -> None:
         step_id: str = data.get("step_id", "")
         logger.info("Step confirmed step_id=%s session=%s", step_id, self.session_id)
+
+        # Track completion and update goal panel
+        if step_id and step_id not in self.state.completed_steps:
+            self.state.completed_steps.append(step_id)
+
+        if self.state.plan and step_id:
+            goal = self._find_goal_for_step(step_id)
+            if goal:
+                step_ids = goal.get("step_ids", [])
+                if all(s in self.state.completed_steps for s in step_ids):
+                    goal["status"] = "done"
+                    await self._send({"type": "goal_update", "goal_id": goal["id"], "status": "done", "failure_subgoals": []})
+                else:
+                    # Goal is still in progress — mark it running if not already
+                    if goal.get("status") != "running":
+                        goal["status"] = "running"
+                        await self._send({"type": "goal_update", "goal_id": goal["id"], "status": "running", "failure_subgoals": []})
+
         self.state.step_index += 1
 
         if self.state.step_index >= self.state.total_steps:
@@ -202,10 +222,31 @@ class PilotConsumer(AsyncWebsocketConsumer):
         self.state.status = "awaiting_healing"
         await self._send({"type": "state_update", "state": self.state.model_dump()})
 
+        # Update goal panel to show this goal as failed with subgoal options
+        if self.state.plan and step_id:
+            goal = self._find_goal_for_step(step_id)
+            if goal:
+                goal["status"] = "failed"
+                await self._send(
+                    {
+                        "type": "goal_update",
+                        "goal_id": goal["id"],
+                        "status": "failed",
+                        "failure_subgoals": goal.get("failure_subgoals", []),
+                    }
+                )
+
         # Feed failure back into the agent for it to call request_healing
+        hb = self.state.last_heartbeat
+        hb_context = (
+            f" Current page URL: {hb.get('url', '?')}."
+            f" Has error on page: {hb.get('has_error', False)}."
+            f" User-modified fields: {hb.get('user_modified_fields', [])}."
+            " Call explore_page to inspect the page, then retry or call request_healing."
+        ) if hb else " Call request_healing to queue a Surveyor re-map for this step."
         failure_msg = (
-            f"Step '{step_id}' failed because selector '{selector}' was not found. "
-            "Please call request_healing to queue a Surveyor re-map for this step."
+            f"Step '{step_id}' failed because selector '{selector}' was not found."
+            + hb_context
         )
         response_text = await self._run_agent(failure_msg)
         if response_text:
@@ -287,6 +328,75 @@ class PilotConsumer(AsyncWebsocketConsumer):
         if response_text:
             await self._dispatch_agent_output(response_text)
 
+    async def _handle_subgoal_selected(self, data: dict) -> None:
+        """
+        User clicked a contingency sub-goal button after a step failed.
+
+        action='retry' — retry the failed step.
+        action='sub_service' — load a different service map (e.g. password reset).
+        """
+        action: str = data.get("action", "")
+        sub_service_id: str = data.get("service_id", "")
+        logger.info(
+            "Subgoal selected action=%s sub_service_id=%s session=%s",
+            action,
+            sub_service_id,
+            self.session_id,
+        )
+
+        if action == "retry":
+            feedback = (
+                f"The user chose to retry the failed step '{self.state.current_step_id}'. "
+                "Please call execute_workflow_step again for that step_id."
+            )
+        elif action == "sub_service" and sub_service_id:
+            # Switch to the recovery service (e.g. forgot-password flow)
+            self.state.service_id = sub_service_id
+            feedback = (
+                f"The user chose the '{sub_service_id}' recovery flow. "
+                f"Call load_service_map with service_id='{sub_service_id}' immediately."
+            )
+        else:
+            logger.warning(
+                "Unknown subgoal action='%s' session=%s", action, self.session_id
+            )
+            return
+
+        self.state.status = "executing"
+        await self._send({"type": "state_update", "state": self.state.model_dump()})
+        response_text = await self._run_agent(feedback)
+        if response_text:
+            await self._dispatch_agent_output(response_text)
+
+    async def _handle_heartbeat(self, data: dict) -> None:
+        """
+        Receive a 15-second page snapshot from the extension.
+
+        Stores the snapshot in self.state.last_heartbeat so it is available
+        to the explore_page tool during the next agent run (via ContextVar).
+        Never triggers an agent run on its own — purely passive storage.
+
+        SECURITY: page_text_preview may contain portal text but no credentials
+        (those are vault-only and never appear in visible page text).
+        """
+        self.state.last_heartbeat = {
+            "url": data.get("url", ""),
+            "title": data.get("title", ""),
+            "page_text_preview": data.get("page_text_preview", ""),
+            "visible_fields": data.get("visible_fields", []),
+            "has_error": bool(data.get("has_error", False)),
+            "has_success": bool(data.get("has_success", False)),
+            "user_modified_fields": data.get("user_modified_fields", []),
+        }
+        logger.debug(
+            "Heartbeat session=%s url=%s has_error=%s user_modified=%s",
+            self.session_id,
+            self.state.last_heartbeat["url"],
+            self.state.last_heartbeat["has_error"],
+            self.state.last_heartbeat["user_modified_fields"],
+        )
+        await self._send({"type": "heartbeat_ack"})
+
     async def _handle_resume_workflow(self, data: dict) -> None:
         """
         Extension sends this after a cross-origin page navigation so the
@@ -305,12 +415,24 @@ class PilotConsumer(AsyncWebsocketConsumer):
             self.session_id,
         )
         await self._send({"type": "state_update", "state": self.state.model_dump()})
-        response_text = await self._run_agent(
-            f"Navigation completed. We are now on a new page. "
-            f"The workflow is '{self.state.service_id}', currently at step index "
-            f"{self.state.step_index} of {self.state.total_steps}. "
-            f"Continue with the next execute_workflow_step call."
-        )
+
+        # retry_current=True means the page was reloaded mid-step (not a navigate action).
+        # Ask the agent to re-execute that specific step rather than move to the next one.
+        if data.get("retry_current"):
+            prompt = (
+                f"The page was reloaded while executing step '{self.state.current_step_id}' "
+                f"in workflow '{self.state.service_id}'. Please retry that step now by calling "
+                f"execute_workflow_step with service_id='{self.state.service_id}' and "
+                f"step_id='{self.state.current_step_id}'."
+            )
+        else:
+            prompt = (
+                f"Navigation completed. We are now on a new page. "
+                f"The workflow is '{self.state.service_id}', currently at step index "
+                f"{self.state.step_index} of {self.state.total_steps}. "
+                f"Continue with the next execute_workflow_step call."
+            )
+        response_text = await self._run_agent(prompt)
         if response_text:
             await self._dispatch_agent_output(response_text)
 
@@ -321,6 +443,8 @@ class PilotConsumer(AsyncWebsocketConsumer):
     # Sentinel prefixes that tools return to trigger consumer-side dispatch.
     # These must be intercepted from ToolMessages before the LLM prose response
     # is forwarded to the extension — the LLM may wrap them in natural language.
+    # BUILD_PLAN is handled separately as a transparent side-effect before
+    # checking for these prefixes.
     _SENTINEL_PREFIXES = (
         "EXECUTE_STEP:",
         "PAUSE_FOR_CONFIRMATION:",
@@ -338,6 +462,9 @@ class PilotConsumer(AsyncWebsocketConsumer):
         from pilot._session_context import set_current_anon_key
         if self.anon_key:
             set_current_anon_key(self.anon_key)
+        # Make the latest heartbeat snapshot available to the explore_page tool.
+        from pilot._session_context import set_current_heartbeat
+        set_current_heartbeat(self.state.last_heartbeat)
         try:
             # Build messages list from chat history
             messages: list = []
@@ -350,7 +477,16 @@ class PilotConsumer(AsyncWebsocketConsumer):
 
             result = await self.agent_executor.ainvoke({"messages": messages})
 
-            # Scan ToolMessages for sentinels — first match wins.
+            # Pass 1: process BUILD_PLAN as a transparent side-effect so the
+            # goal panel is sent to the extension before we look for EXECUTE_STEP.
+            for msg in result["messages"]:
+                if isinstance(msg, ToolMessage):
+                    content = msg.content if isinstance(msg.content, str) else ""
+                    if content.startswith("BUILD_PLAN:"):
+                        await self._process_build_plan(content)
+                        break  # only one plan per agent turn
+
+            # Pass 2: look for regular action sentinels — first match wins.
             # The LLM may wrap the sentinel in prose in its final AIMessage;
             # intercepting from the ToolMessage is more reliable.
             for msg in result["messages"]:
@@ -374,6 +510,36 @@ class PilotConsumer(AsyncWebsocketConsumer):
             self.state.recoverable = False
             await self._send({"type": "state_update", "state": self.state.model_dump()})
             return None
+
+    async def _process_build_plan(self, build_plan_output: str) -> None:
+        """Store the goal tree in state and send set_plan to the extension."""
+        try:
+            payload = json.loads(build_plan_output[len("BUILD_PLAN:"):])
+            self.state.plan = payload.get("goals", [])
+            await self._send(
+                {
+                    "type": "set_plan",
+                    "service_name": payload.get("service_name", ""),
+                    "goals": self.state.plan,
+                }
+            )
+            logger.info(
+                "Plan built: service=%s goals=%d session=%s",
+                payload.get("service_id", "?"),
+                len(self.state.plan),
+                self.session_id,
+            )
+        except (json.JSONDecodeError, KeyError) as exc:
+            logger.error(
+                "Failed to parse BUILD_PLAN payload session=%s: %s", self.session_id, exc
+            )
+
+    def _find_goal_for_step(self, step_id: str) -> dict | None:
+        """Return the first goal node whose step_ids contains step_id."""
+        for goal in self.state.plan:
+            if step_id in goal.get("step_ids", []):
+                return goal
+        return None
 
     async def _dispatch_agent_output(self, output: str) -> None:
         """
@@ -478,12 +644,22 @@ class PilotConsumer(AsyncWebsocketConsumer):
                 self.state.step_index = session.step_index
             if session.total_steps:
                 self.state.total_steps = session.total_steps
+            if session.plan:
+                self.state.plan = list(session.plan)
+                # Reconstruct completed_steps from goals already marked done
+                self.state.completed_steps = [
+                    step_id
+                    for goal in session.plan
+                    if goal.get("status") == "done"
+                    for step_id in goal.get("step_ids", [])
+                ]
             logger.info(
-                "Session state restored: service=%s step=%d/%d history_len=%d session=%s",
+                "Session state restored: service=%s step=%d/%d history_len=%d plan_goals=%d session=%s",
                 self.state.service_id,
                 self.state.step_index,
                 self.state.total_steps,
                 len(self.state.chat_history),
+                len(self.state.plan),
                 self.session_id,
             )
 
@@ -497,6 +673,7 @@ class PilotConsumer(AsyncWebsocketConsumer):
             service_id=self.state.service_id or "",
             step_index=self.state.step_index,
             total_steps=self.state.total_steps,
+            plan=list(self.state.plan),
         )
 
     @database_sync_to_async

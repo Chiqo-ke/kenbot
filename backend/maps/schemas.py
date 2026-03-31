@@ -79,6 +79,19 @@ class ErrorState(BaseModel):
     recovery_action: RecoveryAction
 
 
+class SubGoalSpec(BaseModel):
+    """A contingency sub-goal shown to the user when a step fails."""
+
+    label: str = Field(description="Human-readable label shown in the goal panel.")
+    action: Literal["retry", "sub_service"] = Field(
+        description="'retry' retries the failed step; 'sub_service' loads another service map."
+    )
+    service_id: str | None = Field(
+        None,
+        description="For action='sub_service': the service_id to load (e.g. 'ecitizen_forgot_password').",
+    )
+
+
 class WorkflowStep(BaseModel):
     step_id: str
     step_label: str
@@ -86,6 +99,24 @@ class WorkflowStep(BaseModel):
     url_match_strategy: Literal["exact", "starts-with", "contains", "regex"] = (
         "contains"
     )
+    # --------------- goal-planning fields ---------------
+    phase: str | None = Field(
+        None,
+        description=(
+            "Optional human-readable goal group label (e.g. 'Sign In', 'Fill Details'). "
+            "Steps sharing the same phase are folded under one goal node in the goal panel. "
+            "Falls back to step_label when absent."
+        ),
+    )
+    failure_subgoals: list[SubGoalSpec] = Field(
+        default=[],
+        description=(
+            "Contingency sub-goals shown when this step fails. "
+            "Typically includes a 'retry' option and, for credential steps, "
+            "a 'sub_service' option pointing at a recovery flow."
+        ),
+    )
+    # ----------------------------------------------------
     actions: list[Action]
     next_trigger: Selector | None = None
     success_indicator: Selector
@@ -119,6 +150,15 @@ class ServiceMap(BaseModel):
     required_user_data: list[str] = Field(
         description="Vault keys required to execute this workflow"
     )
+    # --------------- goal-planning fields ---------------
+    requires_auth: str | None = Field(
+        None,
+        description=(
+            "service_id of an auth flow that must run before this service. "
+            "The planner auto-prepends the auth goal tree so maps never inline login steps."
+        ),
+    )
+    # ----------------------------------------------------
     workflow: list[WorkflowStep]
     known_downtimes: list[str] = []
 

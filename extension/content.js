@@ -40,6 +40,13 @@ let currentStepId = null;
 let currentStepIndex = 0;
 let currentTotalSteps = 0;
 
+// Goal plan — populated when server sends set_plan
+let currentPlan = null;
+
+// Heartbeat timer handle and user field-change tracking
+let heartbeatTimer = null;
+let userModifiedFields = new Set();
+
 // ─── Context validity guard ──────────────────────────────────────────────────
 // When the extension is reloaded during development, chrome.runtime.id becomes
 // undefined and any Chrome API call throws "Extension context invalidated".
@@ -89,6 +96,10 @@ function mountOverlay() {
         <span id="kb-status-dot" class="kb-status-dot kb-status-disconnected" aria-label="Disconnected" title="Disconnected"></span>
         <button id="kb-close" class="kb-close" aria-label="Close panel">&times;</button>
       </header>
+      <div id="kb-goals" class="kb-goals" hidden aria-label="Task progress">
+        <span class="kb-goals-title">Progress</span>
+        <ul id="kb-goal-list" class="kb-goal-list" role="list"></ul>
+      </div>
       <div id="kb-messages" class="kb-messages" role="log" aria-live="polite" aria-relevant="additions"></div>
       <div id="kb-confirmation-area" class="kb-confirmation-area" hidden></div>
       <form id="kb-input-form" class="kb-input-form" autocomplete="off">
@@ -188,15 +199,31 @@ async function onWsOpen() {
     dbg('Resuming workflow after navigation', pending);
     safeSend({ type: 'resume_workflow', ...pending });
     appendSystemMessage('↩️ Continuing workflow…', '↩️ Inaendelea…');
+    startHeartbeat();
+    return;
+  }
+
+  // Resume mid-step if the page was reloaded while a step was executing
+  // (e.g. portal-triggered redirect, browser refresh)
+  const activeStep = stored.kenbotSession?.activeStep;
+  if (activeStep) {
+    dbg('Resuming mid-step after page reload', activeStep);
+    await _clearActiveStep();
+    safeSend({ type: 'resume_workflow', ...activeStep, retry_current: true });
+    appendSystemMessage('↩️ Resuming…', '↩️ Inaendelea…');
+    startHeartbeat();
     return;
   }
 
   appendSystemMessage('Connected to KenBot. How can I help you?', 'Imeunganishwa na KenBot. Naweza kukusaidia?');
+  startHeartbeat();
 }
 
 function onWsClose(event) {
   dbg('WebSocket closed code=%d reason=%s', event.code, event.reason || '(none)');
   setStatusIndicator('disconnected');
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
 
   // Normal closure — clean exit, no reconnect
   if (event.code === 1000) {
@@ -289,6 +316,32 @@ async function handlePilotMessage(msg) {
       appendAgentMessage(msg.content_en, msg.content_sw);
       break;
 
+    case 'set_plan': {
+      currentPlan = msg.goals || [];
+      renderGoalPanel(currentPlan, msg.service_name || '');
+      // Persist plan so it survives cross-origin navigation
+      if (isContextValid() && sessionId) {
+        chrome.storage.local.get('kenbotSession', (stored) => {
+          if (chrome.runtime.lastError) return;
+          const session = stored.kenbotSession || { sessionId };
+          chrome.storage.local.set({ kenbotSession: { ...session, plan: currentPlan } });
+        });
+      }
+      break;
+    }
+
+    case 'goal_update': {
+      if (currentPlan) {
+        const goal = currentPlan.find(g => g.id === msg.goal_id);
+        if (goal) {
+          goal.status = msg.status;
+          if (msg.failure_subgoals) goal.failure_subgoals = msg.failure_subgoals;
+        }
+      }
+      updateGoal(msg.goal_id, msg.status, msg.failure_subgoals || []);
+      break;
+    }
+
     case 'execute_action':
       executeAction(msg.action);
       break;
@@ -316,6 +369,9 @@ async function handlePilotMessage(msg) {
     case 'session_complete':
       appendSystemMessage('✅ Task complete!', '✅ Kazi imekamilika!');
       hideConfirmationArea();
+      break;
+
+    case 'heartbeat_ack':
       break;
 
     case 'error':
@@ -535,6 +591,24 @@ async function executeStep(msg) {
   currentStepIndex = msg.step_index || 0;
   currentTotalSteps = msg.total_steps || currentTotalSteps;
 
+  // Persist active step so a page reload mid-step can be recovered.
+  // Written BEFORE actions execute; cleared on confirmed or failed.
+  if (isContextValid()) {
+    const snap = await chrome.storage.local.get('kenbotSession');
+    const session = snap.kenbotSession || { sessionId };
+    await chrome.storage.local.set({
+      kenbotSession: {
+        ...session,
+        activeStep: {
+          service_id: currentServiceId,
+          step_id: stepId,
+          step_index: currentStepIndex,
+          total_steps: currentTotalSteps,
+        },
+      },
+    });
+  }
+
   dbg(
     'executeStep', stepId,
     'index:', msg.step_index, '/', msg.total_steps,
@@ -561,9 +635,11 @@ async function executeStep(msg) {
       await executeActionAsync(action);
     }
     dbg('executeStep complete', stepId);
+    await _clearActiveStep();
     safeSend({ type: 'step_confirmed', step_id: stepId });
   } catch (err) {
     dbg('executeStep error', stepId, err);
+    await _clearActiveStep();
     safeSend({
       type: 'step_failed',
       step_id: stepId,
@@ -970,11 +1046,147 @@ async function restoreChatHistory() {
     return;
   }
   const messages = stored.kenbotSession?.messages;
-  if (!messages || !messages.length) return;
-  for (const msg of messages) {
-    _renderBubble(msg.role, msg.textEn, msg.textSw || msg.textEn);
+  if (messages && messages.length) {
+    for (const msg of messages) {
+      _renderBubble(msg.role, msg.textEn, msg.textSw || msg.textEn);
+    }
+  }
+  // Restore goal plan if one was active
+  const storedPlan = stored.kenbotSession?.plan;
+  if (storedPlan && storedPlan.length) {
+    currentPlan = storedPlan;
+    renderGoalPanel(storedPlan, '');
   }
 }
+
+// ─── Goal Panel ──────────────────────────────────────────────────────────────
+
+/**
+ * Render (or re-render) the goal panel above the message log.
+ * @param {Array<{id, label, status, step_ids, failure_subgoals, is_prerequisite}>} goals
+ * @param {string} serviceName
+ */
+function renderGoalPanel(goals, serviceName) {
+  if (!shadow) return;
+  const goalsEl = shadow.getElementById('kb-goals');
+  const list = shadow.getElementById('kb-goal-list');
+  if (!goalsEl || !list) return;
+
+  list.innerHTML = '';
+  for (const goal of goals) {
+    list.appendChild(_buildGoalItem(goal));
+  }
+  goalsEl.hidden = goals.length === 0;
+}
+
+/**
+ * Build a single <li> element for a goal node.
+ * @param {object} goal
+ * @returns {HTMLLIElement}
+ */
+function _buildGoalItem(goal) {
+  const li = document.createElement('li');
+  const status = goal.status || 'pending';
+  li.className = `kb-goal-item kb-goal-item--${status}${goal.is_prerequisite ? ' kb-goal-item--prereq' : ''}`;
+  li.dataset.goalId = goal.id;
+  li.setAttribute('role', 'listitem');
+
+  const icon = document.createElement('span');
+  icon.className = 'kb-goal-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = _goalIcon(status);
+
+  const label = document.createElement('span');
+  label.className = 'kb-goal-label';
+  label.textContent = goal.label;
+
+  li.appendChild(icon);
+  li.appendChild(label);
+
+  // If already failed on restore, show subgoal buttons immediately
+  if (status === 'failed' && goal.failure_subgoals && goal.failure_subgoals.length) {
+    li.appendChild(_buildSubgoalList(goal.failure_subgoals, li));
+  }
+
+  return li;
+}
+
+/**
+ * Update an existing goal item's status and optionally show subgoal buttons.
+ * @param {string} goalId
+ * @param {'pending'|'running'|'done'|'failed'} status
+ * @param {Array} subgoals
+ */
+function updateGoal(goalId, status, subgoals) {
+  if (!shadow) return;
+  const list = shadow.getElementById('kb-goal-list');
+  if (!list) return;
+
+  const item = list.querySelector(`[data-goal-id="${CSS.escape(goalId)}"]`);
+  if (!item) return;
+
+  // Replace status class
+  item.className = item.className
+    .replace(/\bkb-goal-item--(?:pending|running|done|failed)\b/g, '')
+    .trim() + ` kb-goal-item--${status}`;
+
+  // Update icon
+  const icon = item.querySelector('.kb-goal-icon');
+  if (icon) icon.textContent = _goalIcon(status);
+
+  // Remove any previous subgoal list
+  const existingSg = item.querySelector('.kb-subgoal-list');
+  if (existingSg) existingSg.remove();
+
+  // Show subgoal buttons when goal fails
+  if (status === 'failed' && subgoals && subgoals.length) {
+    item.appendChild(_buildSubgoalList(subgoals, item));
+  }
+}
+
+/**
+ * Build the subgoal <ul> with clickable option buttons.
+ * @param {Array<{label, action, service_id}>} subgoals
+ * @param {HTMLElement} parentItem  — the parent goal <li> (to remove list on click)
+ * @returns {HTMLUListElement}
+ */
+function _buildSubgoalList(subgoals, parentItem) {
+  const ul = document.createElement('ul');
+  ul.className = 'kb-subgoal-list';
+  ul.setAttribute('role', 'list');
+
+  for (const sg of subgoals) {
+    const li = document.createElement('li');
+    const btn = document.createElement('button');
+    btn.className = 'kb-subgoal-btn';
+    btn.type = 'button';
+    btn.textContent = sg.label;
+    btn.addEventListener('click', () => {
+      safeSend({
+        type: 'subgoal_selected',
+        action: sg.action,
+        service_id: sg.service_id || null,
+      });
+      ul.remove();
+    });
+    li.appendChild(btn);
+    ul.appendChild(li);
+  }
+
+  return ul;
+}
+
+/** Return a text character icon for a goal status. */
+function _goalIcon(status) {
+  switch (status) {
+    case 'running': return '●';
+    case 'done':    return '✓';
+    case 'failed':  return '✗';
+    default:        return '○';   // pending
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * Show a confirmation prompt before the Pilot executes a sensitive step.
@@ -1137,6 +1349,87 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// ─── Active-step helpers (Phase 1 reconnection) ──────────────────────────────
+
+/**
+ * Remove the activeStep sentinel from storage on clean step completion or failure.
+ * Leaves sessionId, messages, and plan intact.
+ */
+async function _clearActiveStep() {
+  if (!isContextValid()) return;
+  try {
+    const snap = await chrome.storage.local.get('kenbotSession');
+    const session = snap.kenbotSession || { sessionId };
+    delete session.activeStep;
+    await chrome.storage.local.set({ kenbotSession: session });
+  } catch { /* silent */ }
+}
+
+// ─── Heartbeat (Phase 2) ─────────────────────────────────────────────────────
+
+/**
+ * Start the 15-second heartbeat interval.
+ * Safe to call multiple times — clears any existing timer first.
+ */
+function startHeartbeat() {
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(sendHeartbeat, 15000);
+  dbg('Heartbeat started');
+}
+
+/**
+ * Collect a lightweight page snapshot and send it to the server.
+ * SECURITY: only field names collected, never field values.
+ */
+function sendHeartbeat() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+  // Collect visible form field names (never values)
+  const visibleFields = [];
+  try {
+    document.querySelectorAll('input:not([type=hidden]), select, textarea').forEach((el) => {
+      const label = el.name || el.id || el.getAttribute('aria-label') || '';
+      if (label) visibleFields.push(label);
+    });
+  } catch { /* cross-origin frame — ignore */ }
+
+  // Quick heuristic scans of visible text for error/success states
+  const bodyText = (() => {
+    try { return document.body.innerText || ''; } catch { return ''; }
+  })();
+  const hasError = /error|failed|invalid|incorrect|try again|please enter/i.test(bodyText);
+  const hasSuccess = /success|submitted|confirmed|thank you|complete|approved/i.test(bodyText);
+
+  const payload = {
+    type: 'heartbeat',
+    url: location.href,
+    title: document.title,
+    page_text_preview: bodyText.slice(0, 1000),
+    visible_fields: visibleFields.slice(0, 30), // cap to avoid bloat
+    has_error: hasError,
+    has_success: hasSuccess,
+    user_modified_fields: [...userModifiedFields],
+  };
+
+  safeSend(payload);
+  userModifiedFields = new Set(); // reset after each heartbeat
+  dbg('Heartbeat sent', { url: payload.url, has_error: hasError, has_success: hasSuccess });
+}
+
+/**
+ * Track field names the user is actively editing on the portal.
+ * Filters out KenBot's own shadow DOM to avoid feedback loops.
+ * SECURITY: only e.target.name / id collected, never .value.
+ */
+function trackUserInput(e) {
+  // Ignore events originating inside the KenBot overlay
+  try {
+    if (e.composedPath().some((n) => n && n.id === 'kenbot-host')) return;
+  } catch { return; }
+  const fieldName = e.target.name || e.target.id || e.target.getAttribute('aria-label') || 'unnamed';
+  if (fieldName !== 'unnamed') userModifiedFields.add(fieldName);
+}
+
 // ─── 10. Message bridge from background / popup ───────────────────────────────
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -1175,3 +1468,8 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
 // ─── Entry Point ──────────────────────────────────────────────────────────────
 mountOverlay();
 connectToPilot();
+
+// Listen for user-initiated field edits on the portal page (heartbeat tracking).
+// Using capture=true so we see events even inside iframes on the same origin.
+document.addEventListener('input', trackUserInput, { capture: true, passive: true });
+document.addEventListener('change', trackUserInput, { capture: true, passive: true });

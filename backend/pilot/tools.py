@@ -67,6 +67,10 @@ class ExecuteWorkflowStepInput(BaseModel):
     step_id: str = Field(description="The step_id of the specific workflow step to execute.")
 
 
+class BuildPlanInput(BaseModel):
+    service_id: str = Field(description="The service_id of the service the user wants to complete.")
+
+
 # ---------------------------------------------------------------------------
 # Sentinel prefix the consumer reads to pause execution
 # ---------------------------------------------------------------------------
@@ -294,6 +298,80 @@ def execute_workflow_step(service_id: str, step_id: str) -> str:
     return f"EXECUTE_STEP:{_json.dumps(payload)}"
 
 
+@tool(args_schema=BuildPlanInput)
+def build_execution_plan(service_id: str) -> str:
+    """Build a goal tree for a service and send it to the extension's goal panel.
+
+    Call this immediately after load_service_map succeeds, BEFORE the first
+    execute_workflow_step call. The consumer intercepts the BUILD_PLAN sentinel
+    and sends a set_plan message to the extension so the user can track progress.
+
+    Returns a BUILD_PLAN sentinel string — do NOT forward this to the user as prose.
+    After this call, proceed immediately with execute_workflow_step.
+    """
+    import json as _json
+
+    from maps.repository import MapRepository
+    from pilot.planner import build_goal_tree
+
+    repo = MapRepository()
+    service_map = repo.get_map(service_id)
+    if service_map is None:
+        return f"ERROR: no map found for service_id={service_id}"
+
+    goal_tree = build_goal_tree(service_map)
+    payload = {
+        "service_id": service_id,
+        "service_name": service_map.service_name,
+        "goals": goal_tree,
+    }
+    logger.info(
+        "build_execution_plan service_id=%s goals=%d",
+        service_id,
+        len(goal_tree),
+    )
+    return f"BUILD_PLAN:{_json.dumps(payload)}"
+
+
+class ExplorePageInput(BaseModel):
+    reason: str = Field(
+        description="Brief reason why you are inspecting the page (e.g. 'step failed', 'verifying URL')."
+    )
+
+
+@tool(args_schema=ExplorePageInput)
+def explore_page(reason: str) -> str:
+    """Inspect the current state of the portal page using the latest heartbeat snapshot.
+
+    Returns the current URL, page title, visible text preview, form field names,
+    error/success indicators, and any fields the user has recently modified.
+    The snapshot is up to 15 seconds old.
+
+    Call this before request_healing to understand what is on the page.
+    Call this to verify you are on the correct portal page before executing a step.
+    """
+    from pilot._session_context import get_current_heartbeat
+
+    hb = get_current_heartbeat()
+    if not hb:
+        return (
+            "No page snapshot available yet. "
+            "A heartbeat will arrive within 15 seconds — wait briefly and try again."
+        )
+
+    lines = [
+        f"Current page URL: {hb.get('url', '?')}",
+        f"Page title: {hb.get('title', '?')}",
+        f"Page text preview: {hb.get('page_text_preview', '')[:500]}",
+        f"Visible form fields: {', '.join(hb.get('visible_fields', [])) or 'none detected'}",
+        f"Error indicators detected: {hb.get('has_error', False)}",
+        f"Success indicators detected: {hb.get('has_success', False)}",
+        f"Fields user has recently modified: {', '.join(hb.get('user_modified_fields', [])) or 'none'}",
+    ]
+    logger.info("explore_page called: reason=%s url=%s", reason, hb.get("url", "?"))
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Exported tool list — consumed by agent.py
 # ---------------------------------------------------------------------------
@@ -303,5 +381,7 @@ PILOT_TOOLS = [
     trigger_survey,
     request_healing,
     confirm_submission,
+    build_execution_plan,
     execute_workflow_step,
+    explore_page,
 ]

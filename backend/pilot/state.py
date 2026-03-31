@@ -42,3 +42,9 @@ class ExecutionState(BaseModel):
     recoverable: bool = True
     # Chat history kept in state for the LLM's context window
     chat_history: list[dict] = Field(default_factory=list)
+    # Goal tree built by build_execution_plan; forwarded to the extension as set_plan
+    plan: list[dict] = Field(default_factory=list)
+    # step_ids of workflow steps that have already completed successfully
+    completed_steps: list[str] = Field(default_factory=list)
+    # Most recent heartbeat snapshot from the extension (in-memory, not persisted)
+    last_heartbeat: dict = Field(default_factory=dict)
