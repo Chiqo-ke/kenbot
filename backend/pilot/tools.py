@@ -148,6 +148,62 @@ def get_required_vault_keys(service_id: str) -> list[str]:
     return service_map.required_user_data
 
 
+class CheckSurveyStatusInput(BaseModel):
+    service_id: str = Field(description="The service_id whose survey status to check.")
+
+
+@tool(args_schema=CheckSurveyStatusInput)
+def check_survey_status(service_id: str) -> dict:
+    """Check whether a previously queued survey has completed.
+
+    Returns one of three outcomes:
+    - {"status": "complete", "map": <service_map_dict>}  — survey finished; map is ready.
+      Immediately call build_execution_plan and continue the workflow.
+    - {"status": "running"}  — survey still in progress; wait ~15 s and call again.
+    - {"status": "not_found"}  — no survey job for this service_id has been queued.
+      Call trigger_survey first.
+
+    Use this in a polling loop after trigger_survey until status=="complete".
+    """
+    from surveyor.models import SurveyJob
+    from maps.repository import MapRepository
+
+    try:
+        job = SurveyJob.objects.filter(service_id=service_id).latest("created_at")
+    except SurveyJob.DoesNotExist:
+        return {"status": "not_found"}
+
+    if job.status == SurveyJob.Status.COMPLETE:
+        repo = MapRepository()
+        service_map = repo.get_map(service_id)
+        if service_map is not None:
+            logger.info(
+                "check_survey_status: map ready for service_id=%s", service_id
+            )
+            return {"status": "complete", "map": service_map.model_dump()}
+        # Job says complete but map file is missing — treat as still running.
+        return {"status": "running"}
+
+    if job.status == SurveyJob.Status.FAILED:
+        issues = job.validation_issues or []
+        logger.warning(
+            "check_survey_status: survey failed service_id=%s issues=%s",
+            service_id,
+            issues,
+        )
+        return {
+            "status": "failed",
+            "issues": issues,
+            "message": (
+                "The automated map-building failed for this service. "
+                "Inform the user and suggest they open the portal manually."
+            ),
+        }
+
+    # PENDING or RUNNING
+    return {"status": "running"}
+
+
 @tool(args_schema=HealingRequestInput)
 def request_healing(
     service_id: str,
@@ -359,11 +415,13 @@ def explore_page(reason: str) -> str:
             "A heartbeat will arrive within 15 seconds — wait briefly and try again."
         )
 
+    interactive = hb.get("interactive_elements", [])
     lines = [
         f"Current page URL: {hb.get('url', '?')}",
         f"Page title: {hb.get('title', '?')}",
         f"Page text preview: {hb.get('page_text_preview', '')[:500]}",
         f"Visible form fields: {', '.join(hb.get('visible_fields', [])) or 'none detected'}",
+        f"Interactive elements (buttons/links): {', '.join(interactive[:30]) or 'none detected'}",
         f"Error indicators detected: {hb.get('has_error', False)}",
         f"Success indicators detected: {hb.get('has_success', False)}",
         f"Fields user has recently modified: {', '.join(hb.get('user_modified_fields', [])) or 'none'}",
@@ -373,15 +431,102 @@ def explore_page(reason: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Autonomous navigation tools — used when no ServiceMap exists
+# ---------------------------------------------------------------------------
+
+
+class NavigateBrowserInput(BaseModel):
+    url: str = Field(description="The full URL to navigate the browser to.")
+    reason: str = Field(description="Brief reason why this navigation is needed.")
+
+
+class BrowserClickInput(BaseModel):
+    element_label: str = Field(
+        description=(
+            "Visible text, aria-label, or descriptive label of the element to click. "
+            "Use the exact text you see in explore_page's interactive elements list."
+        )
+    )
+    reason: str = Field(description="Brief reason why this click is needed.")
+
+
+class BrowserFillInput(BaseModel):
+    field_label: str = Field(
+        description=(
+            "The form field label or name as shown in explore_page's visible form fields list. "
+            "Must match a field currently visible on the page."
+        )
+    )
+    vault_key: str = Field(
+        description=(
+            "The vault key holding the value to inject into this field "
+            "(e.g. 'national_id', 'email', 'phone'). Never supply the raw value."
+        )
+    )
+    reason: str = Field(description="Brief reason why this field needs to be filled.")
+
+
+@tool(args_schema=NavigateBrowserInput)
+def navigate_browser(url: str, reason: str) -> str:
+    """Navigate the user's browser to a specific URL.
+
+    Use this when you need to reach a portal page autonomously and no ServiceMap
+    step is available.  Always call explore_page after the navigation
+    to confirm the correct page loaded before taking further actions.
+    """
+    import json as _json
+
+    logger.info("navigate_browser: navigating to %s (%s)", url, reason)
+    return f"NAVIGATE_TO:{_json.dumps({'url': url, 'reason': reason})}"
+
+
+@tool(args_schema=BrowserClickInput)
+def browser_click(element_label: str, reason: str) -> str:
+    """Click an interactive element on the current portal page by its visible label.
+
+    Use this for autonomous navigation when no ServiceMap exists.
+    Always call explore_page first to confirm the element is present.
+    After clicking, call explore_page again to verify the page changed as expected.
+    """
+    import json as _json
+
+    logger.info("browser_click: clicking '%s' (%s)", element_label, reason)
+    return f"CLICK_ELEMENT:{_json.dumps({'label': element_label, 'reason': reason})}"
+
+
+@tool(args_schema=BrowserFillInput)
+def browser_fill(field_label: str, vault_key: str, reason: str) -> str:
+    """Fill a form field on the current portal page using a value from the user's vault.
+
+    Use this for autonomous navigation when no ServiceMap exists.
+    The vault key must reference data the user has already stored.
+    Never guess or fabricate values — only use stored vault keys.
+    """
+    import json as _json
+
+    logger.info(
+        "browser_fill: filling field '%s' with vault_key='%s' (%s)",
+        field_label,
+        vault_key,
+        reason,
+    )
+    return f"FILL_FIELD:{_json.dumps({'field_label': field_label, 'vault_key': vault_key, 'reason': reason})}"
+
+
+# ---------------------------------------------------------------------------
 # Exported tool list — consumed by agent.py
 # ---------------------------------------------------------------------------
 
 PILOT_TOOLS = [
     load_service_map,
     trigger_survey,
+    check_survey_status,
     request_healing,
     confirm_submission,
     build_execution_plan,
     execute_workflow_step,
     explore_page,
+    navigate_browser,
+    browser_click,
+    browser_fill,
 ]

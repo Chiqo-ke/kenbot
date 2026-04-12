@@ -47,6 +47,9 @@ let currentPlan = null;
 let heartbeatTimer = null;
 let userModifiedFields = new Set();
 
+// Dedup guard — prevents identical system messages from stacking during reconnect loops
+let _lastAddedText = '';
+
 // ─── Context validity guard ──────────────────────────────────────────────────
 // When the extension is reloaded during development, chrome.runtime.id becomes
 // undefined and any Chrome API call throws "Extension context invalidated".
@@ -94,6 +97,7 @@ function mountOverlay() {
       <header class="kb-header">
         <span class="kb-title">KenBot</span>
         <span id="kb-status-dot" class="kb-status-dot kb-status-disconnected" aria-label="Disconnected" title="Disconnected"></span>
+        <button id="kb-clear" class="kb-clear" aria-label="Clear chat" title="Clear chat">&#128465;</button>
         <button id="kb-close" class="kb-close" aria-label="Close panel">&times;</button>
       </header>
       <div id="kb-goals" class="kb-goals" hidden aria-label="Task progress">
@@ -126,6 +130,9 @@ function mountOverlay() {
     chatPanel.hidden = true;
     toggleBtn.setAttribute('aria-expanded', 'false');
   });
+
+  const clearBtn = shadow.getElementById('kb-clear');
+  clearBtn.addEventListener('click', clearChat);
 
   inputForm.addEventListener('submit', (e) => {
     e.preventDefault();
@@ -190,6 +197,22 @@ async function onWsOpen() {
   setStatusIndicator('connected');
   if (isContextValid()) chrome.runtime.sendMessage({ type: 'SESSION_STARTED', sessionId });
 
+  // If a navigate_to action was mid-flight when the old page unloaded,
+  // the extension stored the confirmation in sessionStorage so it could
+  // be sent on the new page after reconnect (avoiding ClientDisconnected).
+  const pendingNavConfirm = sessionStorage.getItem('kenbot_pending_nav_confirm');
+  if (pendingNavConfirm) {
+    sessionStorage.removeItem('kenbot_pending_nav_confirm');
+    try {
+      const confirmPayload = JSON.parse(pendingNavConfirm);
+      dbg('Sending deferred navigate_confirmed after page load', confirmPayload.url);
+      // Small delay to ensure the backend has processed the reconnect.
+      setTimeout(() => safeSend(confirmPayload), 300);
+    } catch { /* malformed payload — ignore */ }
+    startHeartbeat();
+    return;
+  }
+
   // Resume workflow if we navigated cross-origin mid-workflow
   const stored = await chrome.storage.local.get('kenbotSession');
   const pending = stored.kenbotSession?.pendingResume;
@@ -207,7 +230,30 @@ async function onWsOpen() {
   // (e.g. portal-triggered redirect, browser refresh)
   const activeStep = stored.kenbotSession?.activeStep;
   if (activeStep) {
-    dbg('Resuming mid-step after page reload', activeStep);
+    // Guard against infinite resume loops (e.g. login redirect on every navigation).
+    // Allow at most 2 auto-resumes per step_id; beyond that, break the loop and
+    // ask the user to take action manually.
+    const resumeKey = `rc_${activeStep.step_id || activeStep.service_id || 'unknown'}`;
+    const resumeCount = stored.kenbotSession?.resumeCounts?.[resumeKey] || 0;
+
+    if (resumeCount >= 2) {
+      // Too many retries for the same step — clear the sentinel and let the
+      // backend (via heartbeat / user message) handle recovery.
+      dbg('Resume loop detected for', resumeKey, '— clearing activeStep');
+      await _clearActiveStep();
+      appendSystemMessage(
+        '⚠️ The automation seems stuck on this page. Please check what the page needs (e.g. log in) and let me know when done.',
+        '⚠️ Mfumo unakwama ukurasa huu. Tafadhali angalia kinachohitajika (k.m. ingia) na niambie unapokuwa tayari.'
+      );
+      startHeartbeat();
+      return;
+    }
+
+    // Increment resume count for this step
+    const updatedResumeCounts = { ...(stored.kenbotSession?.resumeCounts || {}), [resumeKey]: resumeCount + 1 };
+    await chrome.storage.local.set({ kenbotSession: { ...stored.kenbotSession, resumeCounts: updatedResumeCounts } });
+
+    dbg('Resuming mid-step after page reload', activeStep, 'attempt', resumeCount + 1);
     await _clearActiveStep();
     safeSend({ type: 'resume_workflow', ...activeStep, retry_current: true });
     appendSystemMessage('↩️ Resuming…', '↩️ Inaendelea…');
@@ -215,7 +261,11 @@ async function onWsOpen() {
     return;
   }
 
-  appendSystemMessage('Connected to KenBot. How can I help you?', 'Imeunganishwa na KenBot. Naweza kukusaidia?');
+  // Only greet on a genuinely fresh session — skip if prior chat history exists.
+  const hasHistory = (stored.kenbotSession?.messages?.length || 0) > 0;
+  if (!hasHistory) {
+    appendSystemMessage('Connected to KenBot. How can I help you?', 'Imeunganishwa na KenBot. Naweza kukusaidia?');
+  }
   startHeartbeat();
 }
 
@@ -273,6 +323,14 @@ function onWsClose(event) {
     return;
   }
 
+  // Stamp when we disconnected so restoreChatHistory can auto-reset stale sessions.
+  if (isContextValid()) {
+    chrome.storage.local.get('kenbotSession', (s) => {
+      if (chrome.runtime.lastError) return;
+      const sess = s.kenbotSession || {};
+      chrome.storage.local.set({ kenbotSession: { ...sess, disconnectedAt: Date.now() } });
+    });
+  }
   scheduleReconnect();
 }
 
@@ -311,6 +369,10 @@ function onWsMessage(event) {
  * @param {{ type: string, [key: string]: any }} msg
  */
 async function handlePilotMessage(msg) {
+  // Any non-thinking message clears the spinner
+  if (msg.type !== 'agent_thinking' && msg.type !== 'heartbeat_ack' && msg.type !== 'state_update') {
+    _clearThinking();
+  }
   switch (msg.type) {
     case 'agent_message':
       appendAgentMessage(msg.content_en, msg.content_sw);
@@ -374,8 +436,13 @@ async function handlePilotMessage(msg) {
     case 'heartbeat_ack':
       break;
 
+    case 'agent_thinking':
+      _showThinking(msg.text_en, msg.text_sw);
+      break;
+
     case 'error':
-      appendSystemMessage(`❌ Error: ${msg.message}`, `❌ Hitilafu: ${msg.message}`);
+      // Errors are logged to the backend — keep the chat clean.
+      dbg('Server error (not shown in chat):', msg.message);
       break;
 
     case 'captcha_detected':
@@ -385,6 +452,17 @@ async function handlePilotMessage(msg) {
 
     case 'step_complete':
       appendSystemMessage(`✓ ${msg.step_label}`, `✓ ${msg.step_label}`);
+      // Clear resume-loop counter for this step on success
+      if (isContextValid() && (msg.step_id || msg.step_label)) {
+        chrome.storage.local.get('kenbotSession', (snap) => {
+          if (chrome.runtime.lastError) return;
+          const sess = snap.kenbotSession || {};
+          const rc = { ...(sess.resumeCounts || {}) };
+          const rKey = `rc_${msg.step_id || msg.step_label}`;
+          delete rc[rKey];
+          chrome.storage.local.set({ kenbotSession: { ...sess, resumeCounts: rc } });
+        });
+      }
       break;
 
     case 'workflow_complete':
@@ -396,13 +474,98 @@ async function handlePilotMessage(msg) {
       break;
 
     case 'workflow_error':
-      appendSystemMessage(`Error: ${msg.message}`, `Hitilafu: ${msg.message}`);
+      dbg('Workflow error (not shown in chat):', msg.message);
       break;
 
     case 'session_expired':
       appendSystemMessage('Your session has expired. Please log in again.', 'Kipindi chako kimeisha.');
       ws.close(4001);
       break;
+
+    case 'navigate_to': {
+      // Autonomous navigation requested by the agent.
+      // The current page is about to unload so we CANNOT send over this
+      // WebSocket after setting location.href — the connection will close
+      // with code 1001 (going away) before the backend can respond.
+      // Solution: persist the confirmation in sessionStorage and send it
+      // from the NEW page after the WebSocket reconnects in onWsOpen.
+      const targetUrl = msg.url || '';
+      if (targetUrl) {
+        dbg('Autonomous navigate to', targetUrl, '— deferring confirmation to new page');
+        sessionStorage.setItem('kenbot_pending_nav_confirm', JSON.stringify({
+          type: 'navigate_confirmed',
+          url: targetUrl,
+          success: true,
+        }));
+        window.location.href = targetUrl;
+      } else {
+        safeSend({ type: 'navigate_confirmed', url: '', success: false, error: 'No URL provided' });
+      }
+      break;
+    }
+
+    case 'click_element': {
+      // Autonomous click — find element by visible label or aria-label.
+      const clickLabel = (msg.label || '').trim().toLowerCase();
+      let clicked = false;
+      let clickError = '';
+      try {
+        const candidates = document.querySelectorAll(
+          'button, a[href], [role=button], [role=link], input[type=submit], input[type=button]'
+        );
+        for (const el of candidates) {
+          const elText = ((el.textContent || '').trim()
+            || el.getAttribute('aria-label') || el.getAttribute('title') || '').toLowerCase();
+          if (elText.includes(clickLabel) || clickLabel.includes(elText.slice(0, 20))) {
+            el.click();
+            clicked = true;
+            break;
+          }
+        }
+        if (!clicked) clickError = `No element found matching label: ${msg.label}`;
+      } catch (e) {
+        clickError = String(e);
+      }
+      safeSend({ type: 'free_action_result', label: msg.label, success: clicked, error: clickError });
+      break;
+    }
+
+    case 'fill_field': {
+      // Autonomous field fill — fetch vault value and inject.
+      const fieldLabel = (msg.label || '').trim().toLowerCase();
+      const vaultKey = msg.vault_key || '';
+      (async () => {
+        let success = false;
+        let fillError = '';
+        try {
+          // Fetch the value from the vault API
+          const resp = await fetch(`/api/vault/retrieve/?key=${encodeURIComponent(vaultKey)}`, {
+            headers: { 'X-Session-Id': sessionId || '' },
+          });
+          if (!resp.ok) throw new Error(`Vault ${resp.status}`);
+          const { value } = await resp.json();
+          // Find the field by label association or placeholder
+          const inputs = document.querySelectorAll('input:not([type=hidden]), textarea');
+          for (const el of inputs) {
+            const elLabel = (el.getAttribute('aria-label') || el.getAttribute('placeholder')
+              || el.name || el.id || '').toLowerCase();
+            if (elLabel.includes(fieldLabel) || fieldLabel.includes(elLabel.slice(0, 20))) {
+              el.focus();
+              el.value = value;
+              el.dispatchEvent(new Event('input', { bubbles: true }));
+              el.dispatchEvent(new Event('change', { bubbles: true }));
+              success = true;
+              break;
+            }
+          }
+          if (!success) fillError = `No field found matching label: ${msg.label}`;
+        } catch (e) {
+          fillError = String(e);
+        }
+        safeSend({ type: 'free_action_result', label: msg.label, success, error: fillError });
+      })();
+      break;
+    }
 
     default:
       break;
@@ -962,11 +1125,92 @@ function reportStepFailed(selector, semanticName, reason) {
 
 // ─── 7. Overlay UI Helpers ───────────────────────────────────────────────────
 
+/**
+ * Clear the chat history, goal plan, and any thinking indicators.
+ * Wipes chrome.storage.local messages + plan while keeping the sessionId.
+ */
+async function clearChat() {
+  const log = shadow && shadow.getElementById('kb-messages');
+  if (log) log.innerHTML = '';
+  currentPlan = null;
+  const goalsEl = shadow && shadow.getElementById('kb-goals');
+  if (goalsEl) goalsEl.hidden = true;
+  if (isContextValid()) {
+    const stored = await chrome.storage.local.get('kenbotSession');
+    const sess = stored.kenbotSession || {};
+    delete sess.messages;
+    delete sess.plan;
+    delete sess.disconnectedAt;
+    delete sess.activeStep;
+    sess.resumeCounts = {};
+    await chrome.storage.local.set({ kenbotSession: sess });
+    safeSend({ type: 'reset_session' });
+  }
+  appendSystemMessage('Chat cleared.', 'Mazungumzo yamefutwa.');
+}
+
+/** Ephemeral ID of the currently-displayed thinking bubble (if any). */
+let _thinkingBubbleId = null;
+
+/**
+ * Show (or replace) a thinking/progress indicator in the chat.
+ * These bubbles are NOT persisted to storage — they disappear on reload.
+ * @param {string} textEn
+ * @param {string} textSw
+ */
+function _showThinking(textEn, textSw) {
+  if (!shadow) return;
+  const log = shadow.getElementById('kb-messages');
+  if (!log) return;
+
+  // Remove previous thinking bubble if still visible
+  if (_thinkingBubbleId) {
+    const prev = log.querySelector(`[data-thinking-id="${_thinkingBubbleId}"]`);
+    if (prev) prev.remove();
+  }
+
+  _thinkingBubbleId = `t-${Date.now()}`;
+  const bubble = document.createElement('div');
+  bubble.className = 'kb-message kb-message--thinking';
+  bubble.dataset.thinkingId = _thinkingBubbleId;
+
+  const enSpan = document.createElement('span');
+  enSpan.className = 'kb-msg-en';
+  enSpan.textContent = textEn;
+  bubble.appendChild(enSpan);
+
+  if (textSw && textSw !== textEn) {
+    bubble.appendChild(document.createElement('br'));
+    const swSpan = document.createElement('span');
+    swSpan.className = 'kb-msg-sw';
+    swSpan.textContent = textSw;
+    bubble.appendChild(swSpan);
+  }
+
+  log.appendChild(bubble);
+  log.scrollTop = log.scrollHeight;
+}
+
+/**
+ * Remove the current thinking bubble (called when a real message arrives).
+ */
+function _clearThinking() {
+  if (!shadow || !_thinkingBubbleId) return;
+  const log = shadow.getElementById('kb-messages');
+  if (!log) return;
+  const prev = log.querySelector(`[data-thinking-id="${_thinkingBubbleId}"]`);
+  if (prev) prev.remove();
+  _thinkingBubbleId = null;
+}
+
+
+
 function appendAgentMessage(textEn, textSw) {
   addMessage('agent', textEn, textSw);
 }
 
 function appendUserMessage(text) {
+  _lastAddedText = '';  // reset dedup guard so the next system/agent message is always shown
   addMessage('user', text, text);
 }
 
@@ -981,6 +1225,11 @@ function appendSystemMessage(textEn, textSw) {
  * @param {string} textSw
  */
 function addMessage(role, textEn, textSw) {
+  // Skip if this exact text was the last thing appended (prevents log spam
+  // during reconnect loops where the same step message repeats).
+  if (role !== 'user' && textEn === _lastAddedText) return;
+  _lastAddedText = textEn;
+
   _renderBubble(role, textEn, textSw);
 
   // Persist so the chat log survives cross-origin page navigation.
@@ -1045,6 +1294,18 @@ async function restoreChatHistory() {
   } catch {
     return;
   }
+
+  // Auto-reset if the session has been idle for more than 3 minutes.
+  const IDLE_RESET_MS = 3 * 60 * 1000;
+  const disconnectedAt = stored.kenbotSession?.disconnectedAt;
+  if (disconnectedAt && (Date.now() - disconnectedAt) > IDLE_RESET_MS) {
+    dbg('Chat history stale (>3 min idle) — resetting session');
+    await chrome.storage.local.set({
+      kenbotSession: { sessionId: stored.kenbotSession?.sessionId },
+    });
+    return;
+  }
+
   const messages = stored.kenbotSession?.messages;
   if (messages && messages.length) {
     for (const msg of messages) {
@@ -1400,12 +1661,24 @@ function sendHeartbeat() {
   const hasError = /error|failed|invalid|incorrect|try again|please enter/i.test(bodyText);
   const hasSuccess = /success|submitted|confirmed|thank you|complete|approved/i.test(bodyText);
 
+  // Collect interactive element labels (buttons, links) — labels only, never values
+  const interactiveElements = [];
+  try {
+    document.querySelectorAll('button, a[href], [role=button], [role=link]').forEach((el) => {
+      if (interactiveElements.length >= 40) return;
+      const label = (el.textContent || '').trim().slice(0, 60)
+        || el.getAttribute('aria-label') || el.getAttribute('title') || '';
+      if (label) interactiveElements.push(label);
+    });
+  } catch { /* cross-origin frame — ignore */ }
+
   const payload = {
     type: 'heartbeat',
     url: location.href,
     title: document.title,
     page_text_preview: bodyText.slice(0, 1000),
     visible_fields: visibleFields.slice(0, 30), // cap to avoid bloat
+    interactive_elements: interactiveElements,
     has_error: hasError,
     has_success: hasSuccess,
     user_modified_fields: [...userModifiedFields],

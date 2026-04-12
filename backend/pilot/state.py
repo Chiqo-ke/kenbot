@@ -48,3 +48,7 @@ class ExecutionState(BaseModel):
     completed_steps: list[str] = Field(default_factory=list)
     # Most recent heartbeat snapshot from the extension (in-memory, not persisted)
     last_heartbeat: dict = Field(default_factory=dict)
+    # Per-step failure counters — reset when a step succeeds
+    step_fail_counts: dict[str, int] = Field(default_factory=dict)
+    # URL where the bot paused for the user to take manual portal action (login/form)
+    awaiting_portal_url: str = ""

@@ -175,10 +175,10 @@ GITHUB_MODELS_BASE_URL: str = os.environ.get(
 # Which model each agent uses.  Override via env var to switch models at runtime
 # without changing code. See auth_github.py for the full list of available models.
 KENBOT_PILOT_MODEL: str = os.environ.get(
-    "KENBOT_PILOT_MODEL", "openai/gpt-4o-mini"
+    "KENBOT_PILOT_MODEL", "openai/gpt-4.1-mini"
 )
 KENBOT_SURVEYOR_MODEL: str = os.environ.get(
-    "KENBOT_SURVEYOR_MODEL", "openai/claude-sonnet-4-6"
+    "KENBOT_SURVEYOR_MODEL", "openai/gpt-4o-mini"
 )
 
 # ---------------------------------------------------------------------------

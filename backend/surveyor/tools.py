@@ -18,6 +18,40 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+def _patch_llm_for_browser_use(llm: Any) -> Any:
+    """
+    browser-use sets arbitrary attributes on the LLM object during Agent
+    construction (e.g. ``provider``, ``ainvoke``).
+    LangChain's Pydantic v2 ChatOpenAI blocks those with:
+        ValueError: "ChatOpenAI" object has no field "<name>"
+    We wrap the LLM in a thin proxy that stores all such overrides in a plain
+    dict and forwards everything else to the real LLM, so browser-use can
+    augment it freely without hitting Pydantic.
+    """
+
+    class _LLMProxy:
+        """Proxy that absorbs arbitrary setattr calls from browser-use."""
+
+        def __init__(self, wrapped: Any) -> None:
+            # Use object.__setattr__ so our own __setattr__ is not triggered.
+            object.__setattr__(self, "_w", wrapped)
+            # Pre-seed the provider attribute browser-use checks on init.
+            object.__setattr__(self, "_overrides", {"provider": "openai"})
+
+        def __setattr__(self, name: str, value: Any) -> None:
+            # Store ANY attribute browser-use (or any caller) tries to set
+            # in a plain dict — completely bypasses Pydantic validation.
+            object.__getattribute__(self, "_overrides")[name] = value
+
+        def __getattr__(self, name: str) -> Any:
+            overrides = object.__getattribute__(self, "_overrides")
+            if name in overrides:
+                return overrides[name]
+            return getattr(object.__getattribute__(self, "_w"), name)
+
+    return _LLMProxy(llm)
+
+
 async def run_browser_exploration(
     task: str,
     start_url: str,
@@ -36,31 +70,55 @@ async def run_browser_exploration(
             prompt via ``extend_system_message``, making the agent aware of
             its role as the KenBot Surveyor.
     """
-    from browser_use import Agent, Browser, BrowserConfig
-
-    config = BrowserConfig(
-        headless=True,
-        # Disable JavaScript-only extensions/popups that clutter gov portals.
-        disable_security=False,
-    )
-    browser = Browser(config=config)
-
+    # browser-use API changed across versions.  Try the modern path first
+    # (BrowserProfile passed directly to Agent), then fall back to the legacy
+    # Browser(config=BrowserConfig(...)) pattern.
     try:
+        from browser_use import Agent, BrowserProfile
+
+        profile = BrowserProfile(
+            headless=True,
+            disable_security=False,
+        )
+        llm = _patch_llm_for_browser_use(llm)
         agent = Agent(
             task=task,
             llm=llm,
-            browser=browser,
-            # Tell browser-use to prefer the accessibility tree approach.
+            browser_profile=profile,
             use_vision=False,
-            # Extend the default system prompt with the Surveyor's purpose.
             extend_system_message=system_prompt,
         )
         result = await agent.run()
         raw_text: str = result.final_result() or "{}"
         logger.debug("Surveyor: browser-use raw result: %s", raw_text[:500])
         return json.loads(raw_text)
-    finally:
-        await browser.close()
+    except (ImportError, TypeError):
+        # Legacy API: Browser wraps a BrowserConfig/BrowserProfile object
+        try:
+            from browser_use import Agent, Browser, BrowserProfile as _BrowserConfig
+        except ImportError:
+            from browser_use import Agent, Browser, BrowserConfig as _BrowserConfig  # type: ignore[no-redef]
+
+        _config = _BrowserConfig(
+            headless=True,
+            disable_security=False,
+        )
+        browser = Browser(config=_config)
+        try:
+            llm = _patch_llm_for_browser_use(llm)
+            agent = Agent(
+                task=task,
+                llm=llm,
+                browser=browser,
+                use_vision=False,
+                extend_system_message=system_prompt,
+            )
+            result = await agent.run()
+            raw_text = result.final_result() or "{}"
+            logger.debug("Surveyor: browser-use raw result: %s", raw_text[:500])
+            return json.loads(raw_text)
+        finally:
+            await browser.close()
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +143,7 @@ async def explore_portal_tool(
 ) -> str:
     """
     Explore a Kenyan government portal service and return a ServiceMap JSON
-    string. Uses browser-use with GPT-4o via GitHub Models.
+    string. Uses browser-use with GPT-4o mini via GitHub Models.
 
     The LLM must NEVER receive real credentials. Placeholder values are used.
     """
@@ -94,11 +152,12 @@ async def explore_portal_tool(
 
     from surveyor.agent import SurveyState, build_surveyor_graph
 
-    raw_model = settings.KENBOT_SURVEYOR_MODEL  # e.g. "openai/gpt-4o"
-    model_provider = raw_model.split("/", 1)[0] if "/" in raw_model else "openai"
+    raw_model = settings.KENBOT_SURVEYOR_MODEL  # e.g. "openai/gpt-4o-mini"
+    # Strip the vendor prefix if present — GitHub Models API is always OpenAI-compatible.
+    model_name = raw_model.split("/", 1)[-1] if "/" in raw_model else raw_model
     llm = init_chat_model(  # noqa: F841 — stored in state, not used directly here
-        model=raw_model,
-        model_provider=model_provider,
+        model=model_name,
+        model_provider="openai",  # GitHub Models endpoint is OpenAI-compatible
         base_url=settings.GITHUB_MODELS_BASE_URL,
         api_key=settings.GITHUB_TOKEN,
     )

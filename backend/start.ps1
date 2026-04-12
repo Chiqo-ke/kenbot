@@ -58,10 +58,10 @@ if ($token -eq "missing") {
 
 Write-Host ""
 Write-Host "Starting KenBot backend..." -ForegroundColor Cyan
-$pilotDisplay    = if ($env:KENBOT_PILOT_MODEL)    { $env:KENBOT_PILOT_MODEL }    else { 'openai/gpt-4o-mini (default)' }
-$surveyorDisplay = if ($env:KENBOT_SURVEYOR_MODEL) { $env:KENBOT_SURVEYOR_MODEL } else { 'openai/gpt-4o (default)' }
+$pilotDisplay    = if ($env:KENBOT_PILOT_MODEL)    { $env:KENBOT_PILOT_MODEL }    else { 'Anthropic/gpt-4o-mini (default)' }
+$surveyorDisplay = if ($env:KENBOT_SURVEYOR_MODEL) { $env:KENBOT_SURVEYOR_MODEL } else { 'openai/gpt-4o-mini (default)' }
 Write-Host "  Pilot model:    $pilotDisplay"
-Write-Host "  Surveyor model: $surveyorDisplay"
+Write-Host "  Surveyor model: $surveyorDisplay" 
 Write-Host "  WebSocket:      ws://localhost:8000/ws/pilot/<session_id>/"
 Write-Host "  API:            http://localhost:8000/api/"
 Write-Host ""

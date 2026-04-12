@@ -67,18 +67,21 @@ _MAX_HEALING_ATTEMPTS = 3
 
 
 def _get_llm():
-    """Return the configured Surveyor LLM via the GitHub Models endpoint."""
+    """Return the configured Surveyor LLM via the GitHub Models endpoint.
+
+    GitHub Models exposes an OpenAI-compatible API, so the provider is always
+    "openai" regardless of the vendor prefix in the model name (e.g.
+    "openai/gpt-4o-mini" → model_name="gpt-4o-mini").
+    """
     from django.conf import settings
 
-    raw_model = settings.KENBOT_SURVEYOR_MODEL  # e.g. "openai/claude-sonnet-4-6"
-    if "/" in raw_model:
-        model_provider, model_name = raw_model.split("/", 1)
-    else:
-        model_provider, model_name = "openai", raw_model
+    raw_model = settings.KENBOT_SURVEYOR_MODEL  # e.g. "openai/gpt-4o-mini"
+    # Strip the vendor prefix if present — the GitHub Models API is OpenAI-compatible.
+    model_name = raw_model.split("/", 1)[-1] if "/" in raw_model else raw_model
 
     return init_chat_model(
         model=model_name,
-        model_provider=model_provider,
+        model_provider="openai",  # GitHub Models endpoint is OpenAI-compatible
         base_url=settings.GITHUB_MODELS_BASE_URL,
         api_key=settings.GITHUB_TOKEN,
     )

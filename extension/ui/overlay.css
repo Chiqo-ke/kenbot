@@ -117,6 +117,19 @@
 .kb-close:hover         { color: #fff; background: rgba(255,255,255,0.15); }
 .kb-close:focus-visible { outline: 2px solid var(--kb-accent); }
 
+.kb-clear {
+  all: unset;
+  cursor: pointer;
+  padding: 2px 6px;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: var(--kb-radius-sm);
+  color: rgba(255,255,255,0.7);
+  transition: color 0.15s, background 0.15s;
+}
+.kb-clear:hover         { color: #fff; background: rgba(255,255,255,0.15); }
+.kb-clear:focus-visible { outline: 2px solid var(--kb-accent); }
+
 /* ── Progress Bar ──────────────────────────────────────────── */
 .kb-progress-wrapper {
   padding: 6px 14px 4px;
@@ -196,6 +209,34 @@
   border: 1px solid var(--kb-border);
   max-width: 100%;
   text-align: center;
+}
+
+/* Ephemeral thinking / progress indicator */
+.kb-message--thinking {
+  align-self: flex-start;
+  background: transparent;
+  color: var(--kb-text-muted);
+  font-size: 12px;
+  font-style: italic;
+  padding: 4px 8px;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.kb-message--thinking::before {
+  content: '';
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--kb-border);
+  border-top-color: var(--kb-primary);
+  border-radius: 50%;
+  animation: kb-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes kb-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* Swahili translation shown in smaller muted text */
